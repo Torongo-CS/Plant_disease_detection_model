@@ -1,0 +1,642 @@
+from picamera2 import Picamera2
+from libcamera import Transform
+import numpy as np
+import cv2
+import time
+
+from ai_edge_litert.interpreter import Interpreter
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+MODEL_PATH = "BEST_MODEL_MobileNetV3Large_raspi_fp16.tflite"
+
+CLASS_NAMES = [
+    "Potato Early Blight",
+    "Potato Late Blight",
+    "Potato Healthy",
+    "Tomato Early Blight",
+    "Tomato Late Blight",
+    "Tomato Healthy",
+    "Class 6",
+    "Class 7"
+]
+
+
+# ============================================================
+# CAMERA SETTINGS
+# ============================================================
+
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 720
+
+# Full sensor resolution - matches the default resolution used by:
+# rpicam-still -o test.jpg --exposure normal --shutter 20000 --gain 2.0 --awbgains 1.5,1.5
+# (OV5647 max resolution: 2592x1944)
+CAPTURE_WIDTH = 2592
+CAPTURE_HEIGHT = 1944
+
+TARGET_FPS = 30
+
+# Keep the image as captured (no rotation).
+ROTATE_180 = False
+
+
+# ============================================================
+# LOAD MODEL
+# ============================================================
+
+print("Loading model...")
+
+interpreter = Interpreter(
+    model_path=MODEL_PATH
+)
+
+interpreter.allocate_tensors()
+
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+input_shape = input_details[0]["shape"]
+output_shape = output_details[0]["shape"]
+
+INPUT_HEIGHT = int(input_shape[1])
+INPUT_WIDTH = int(input_shape[2])
+
+print()
+print("========================================")
+print("MODEL INFORMATION")
+print("========================================")
+
+print("Input shape :", input_shape)
+print("Input dtype :", input_details[0]["dtype"])
+
+print("Output shape:", output_shape)
+print("Output dtype:", output_details[0]["dtype"])
+
+print("Input size  :", INPUT_WIDTH, "x", INPUT_HEIGHT)
+
+print("========================================")
+print()
+
+
+# ============================================================
+# CAMERA
+# ============================================================
+
+print("Starting Raspberry Pi camera...")
+
+picam2 = Picamera2()
+
+
+# ------------------------------------------------------------
+# 180 DEGREE ROTATION
+# ------------------------------------------------------------
+
+if ROTATE_180:
+
+    transform = Transform(
+        hflip=1,
+        vflip=1
+    )
+
+else:
+
+    transform = Transform()
+
+
+# ============================================================
+# CAMERA CONFIGURATION
+# ============================================================
+
+camera_config = picam2.create_preview_configuration(
+
+    main={
+        "size": (
+            CAMERA_WIDTH,
+            CAMERA_HEIGHT
+        ),
+        "format": "RGB888"
+    },
+
+    transform=transform,
+
+    # Lower buffer count helps keep preview latency low.
+    buffer_count=4
+)
+
+
+picam2.configure(camera_config)
+
+
+# ============================================================
+# STILL CONFIGURATION (FULL RESOLUTION)
+#
+# Used only when SPACE is pressed, so that captured.jpg is saved
+# at the camera's full sensor resolution - matching what
+# rpicam-still produces (2592x1944), instead of the smaller
+# 1280x720 preview/inference resolution.
+# ============================================================
+
+still_config = picam2.create_still_configuration(
+
+    main={
+        "size": (
+            CAPTURE_WIDTH,
+            CAPTURE_HEIGHT
+        ),
+        "format": "RGB888"
+    },
+
+    transform=transform
+)
+
+
+# ============================================================
+# CAMERA CONTROLS
+# ============================================================
+
+print("Applying camera controls...")
+
+
+# ============================================================
+# CAMERA SETTINGS
+#
+# Fixed values matching exactly:
+# rpicam-still --exposure normal --shutter 20000 --gain 2.0 --awbgains 1.5,1.5
+#
+# All auto behaviour is disabled so these exact values are used
+# on every frame, both in the live preview and in captured.jpg.
+# ============================================================
+
+try:
+
+    picam2.set_controls({
+
+        # Turn OFF auto-exposure so ExposureTime/AnalogueGain stick
+        "AeEnable": False,
+
+        # Turn OFF auto white balance so ColourGains stick
+        "AwbEnable": False,
+
+        # Shutter speed in microseconds (20000us = 1/50s)
+        "ExposureTime": 20000,
+
+        # Analogue gain (~ISO). Matches --gain 2.0
+        "AnalogueGain": 2.0,
+
+        # Manual white balance gains (red_gain, blue_gain).
+        # Matches --awbgains 1.5,1.5
+        "ColourGains": (1.5, 1.5),
+
+        # Lock frame duration to exactly 1/30s -> fixed 30 FPS
+        "FrameDurationLimits": (
+            33333,
+            33333
+        ),
+
+        # Fast noise reduction.
+        #
+        # High-quality noise reduction can reduce
+        # achievable FPS.
+        "NoiseReductionMode": 1
+
+    })
+
+except Exception as e:
+
+    print()
+    print("WARNING: Some camera controls could not be applied.")
+    print(e)
+    print()
+
+
+# ============================================================
+# START CAMERA
+# ============================================================
+
+picam2.start()
+
+
+print()
+print("Allowing camera ISP to stabilize...")
+print("Exposure + White Balance locked to fixed manual values.")
+
+time.sleep(3)
+
+
+print()
+print("========================================")
+print("CAMERA READY")
+print("========================================")
+print("Resolution :", CAMERA_WIDTH, "x", CAMERA_HEIGHT)
+print("Target FPS :", TARGET_FPS)
+print("Rotation   :", "180 degrees" if ROTATE_180 else "None")
+print("AWB        : MANUAL (ColourGains = 1.5, 1.5)")
+print("Exposure   : MANUAL (ExposureTime = 20000us, AnalogueGain = 2.0)")
+print("FPS Lock   : 30 FPS (FrameDurationLimits = 33333us)")
+print("========================================")
+print()
+
+
+# ============================================================
+# MODEL PREPROCESSING
+# ============================================================
+
+def preprocess(image):
+
+    # --------------------------------------------------------
+    # image is RGB
+    # --------------------------------------------------------
+
+    resized = cv2.resize(
+        image,
+        (
+            INPUT_WIDTH,
+            INPUT_HEIGHT
+        ),
+        interpolation=cv2.INTER_AREA
+    )
+
+    # --------------------------------------------------------
+    # FLOAT32 NORMALIZATION
+    #
+    # This assumes the model was trained with:
+    #
+    # image / 255.0
+    #
+    # Keep this exactly the same as training.
+    # --------------------------------------------------------
+
+    resized = resized.astype(
+        np.float32
+    ) / 255.0
+
+    resized = np.expand_dims(
+        resized,
+        axis=0
+    )
+
+    return resized
+
+
+# ============================================================
+# PREDICTION
+# ============================================================
+
+def predict(image):
+
+    input_tensor = preprocess(image)
+
+    interpreter.set_tensor(
+        input_details[0]["index"],
+        input_tensor
+    )
+
+    start_time = time.perf_counter()
+
+    interpreter.invoke()
+
+    inference_time = (
+        time.perf_counter()
+        - start_time
+    ) * 1000.0
+
+    output = interpreter.get_tensor(
+        output_details[0]["index"]
+    )[0]
+
+    predicted_index = int(
+        np.argmax(output)
+    )
+
+    confidence = float(
+        output[predicted_index]
+    )
+
+    if predicted_index < len(CLASS_NAMES):
+
+        label = CLASS_NAMES[
+            predicted_index
+        ]
+
+    else:
+
+        label = f"Class {predicted_index}"
+
+    return (
+        label,
+        confidence,
+        inference_time
+    )
+
+
+# ============================================================
+# FPS TRACKING
+# ============================================================
+
+fps_counter = 0
+
+fps_timer = time.perf_counter()
+
+fps = 0.0
+
+
+# ============================================================
+# LAST PREDICTION
+# ============================================================
+
+last_result = None
+
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
+print()
+print("========================================")
+print("PLANT DISEASE DETECTOR")
+print("========================================")
+print("SPACE = Capture + Detect")
+print("Q     = Quit")
+print("========================================")
+print()
+
+
+try:
+
+    while True:
+
+        # ====================================================
+        # CAPTURE FRAME
+        # ====================================================
+
+        frame = picam2.capture_array()
+
+
+        # ====================================================
+        # FPS
+        # ====================================================
+
+        fps_counter += 1
+
+        elapsed = (
+            time.perf_counter()
+            - fps_timer
+        )
+
+        if elapsed >= 1.0:
+
+            fps = (
+                fps_counter
+                / elapsed
+            )
+
+            fps_counter = 0
+
+            fps_timer = (
+                time.perf_counter()
+            )
+
+
+        # ====================================================
+        # RGB -> BGR FOR OPENCV
+        # ====================================================
+
+        display = cv2.cvtColor(
+            frame,
+            cv2.COLOR_RGB2BGR
+        )
+
+        # ====================================================
+        # TOP INFORMATION
+        # ====================================================
+
+        cv2.rectangle(
+            display,
+            (0, 0),
+            (500, 180),
+            (0, 0, 0),
+            -1
+        )
+
+
+        cv2.putText(
+            display,
+            f"FPS: {fps:.1f}",
+            (20, 35),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA
+        )
+
+
+        cv2.putText(
+            display,
+            "SPACE = Capture",
+            (20, 65),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA
+        )
+
+
+        cv2.putText(
+            display,
+            "Q = Quit",
+            (20, 90),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA
+        )
+
+        # ====================================================
+        # PREDICTION RESULT
+        # ====================================================
+
+        if last_result is not None:
+
+            label, confidence, inference_time = (
+                last_result
+            )
+
+
+            cv2.putText(
+                display,
+                label,
+                (20, 125),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA
+            )
+
+
+            cv2.putText(
+                display,
+                f"Confidence: {confidence * 100:.1f}%",
+                (20, 150),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA
+            )
+
+
+            cv2.putText(
+                display,
+                f"Inference: {inference_time:.1f} ms",
+                (20, 175),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.50,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA
+            )
+
+
+        # ====================================================
+        # DISPLAY
+        # ====================================================
+
+        cv2.imshow(
+            "Raspberry Pi Plant Disease Detector",
+            display
+        )
+
+
+        # ====================================================
+        # KEYBOARD
+        # ====================================================
+
+        key = cv2.waitKey(1) & 0xFF
+
+
+        # ====================================================
+        # SPACE
+        # ====================================================
+
+        if key == 32:
+
+            print()
+            print("========================================")
+            print("CAPTURING...")
+            print("========================================")
+
+
+            # ------------------------------------------------
+            # CAPTURE FULL RESOLUTION STILL
+            #
+            # switch_mode_and_capture_array() briefly switches
+            # the camera to the full-resolution still config,
+            # captures one frame, then switches back to the
+            # preview config automatically. Manual exposure/
+            # gain/AWB controls set earlier are preserved.
+            # ------------------------------------------------
+
+            full_res_frame = picam2.switch_mode_and_capture_array(
+                still_config
+            )
+
+
+            # ------------------------------------------------
+            # SAVE IMAGE
+            # ------------------------------------------------
+
+            captured_bgr = cv2.cvtColor(
+                full_res_frame,
+                cv2.COLOR_RGB2BGR
+            )
+
+
+            cv2.imwrite(
+                "captured.jpg",
+                captured_bgr,
+                [
+                    cv2.IMWRITE_JPEG_QUALITY,
+                    95
+                ]
+            )
+
+
+            print(
+                f"Saved: captured.jpg "
+                f"({CAPTURE_WIDTH}x{CAPTURE_HEIGHT})"
+            )
+
+
+            # ------------------------------------------------
+            # RUN MODEL
+            # ------------------------------------------------
+
+            label, confidence, inference_time = predict(
+                full_res_frame
+            )
+
+
+            last_result = (
+                label,
+                confidence,
+                inference_time
+            )
+
+
+            # ------------------------------------------------
+            # RESULT
+            # ------------------------------------------------
+
+            print("----------------------------------------")
+
+            print(
+                "Prediction :",
+                label
+            )
+
+            print(
+                f"Confidence : "
+                f"{confidence * 100:.2f}%"
+            )
+
+            print(
+                f"Inference  : "
+                f"{inference_time:.2f} ms"
+            )
+
+            print("----------------------------------------")
+
+
+        # ====================================================
+        # QUIT
+        # ====================================================
+
+        elif key == ord("q"):
+
+            print()
+            print("Quitting...")
+
+            break
+
+
+# ============================================================
+# CLEANUP
+# ============================================================
+
+finally:
+
+    picam2.stop()
+
+    cv2.destroyAllWindows()
+
+    print()
+    print("Camera stopped.")
+    print("Program ended.")
