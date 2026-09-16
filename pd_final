@@ -1,0 +1,2544 @@
+import os
+import time
+import threading
+from datetime import datetime
+
+import cv2
+import numpy as np
+from flask import Flask, Response, render_template_string, jsonify
+
+from picamera2 import Picamera2
+from ai_edge_litert.interpreter import Interpreter
+
+from PIL import Image
+from io import BytesIO
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+MODEL_1_PATH = "BEST_MODEL_MobileNetV3Large_raspi_fp16.tflite"
+MODEL_2_PATH = "pd_v1.tflite"
+
+IMAGE_SIZE = 224
+
+# Model weights
+# MobileNetV3 has substantially better reported accuracy.
+MODEL_1_WEIGHT = 0.80
+MODEL_2_WEIGHT = 0.20
+
+# Camera
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 720
+CAMERA_FPS = 30
+
+# JPEG quality for browser stream
+JPEG_QUALITY = 82
+
+# Dummy environmental data
+DUMMY_TEMPERATURE = 27.4
+DUMMY_HUMIDITY = 68.0
+
+# OpenRouter
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+
+# Change this to whichever OpenRouter model you prefer.
+OPENROUTER_MODEL = "google/gemma-4-31b-it:free"
+
+
+# ============================================================
+# CLASS NAMES
+# MUST EXACTLY MATCH TRAINING ORDER
+# ============================================================
+
+CLASS_NAMES = [
+    "Potato Early Blight",
+    "Potato Late Blight",
+    "Potato Healthy",
+    "Tomato Early Blight",
+    "Tomato Late Blight",
+    "Tomato Leaf Mold",
+    "Tomato Septoria",
+    "Tomato Healthy",
+]
+
+
+# ============================================================
+# FLASK
+# ============================================================
+
+app = Flask(__name__)
+
+
+# ============================================================
+# CAMERA
+# ============================================================
+
+print("Initializing Raspberry Pi camera...")
+
+camera = Picamera2()
+
+camera_config = camera.create_video_configuration(
+    main={
+        "size": (
+            CAMERA_WIDTH,
+            CAMERA_HEIGHT
+        ),
+        "format": "RGB888"
+    },
+    controls={
+        "FrameRate": CAMERA_FPS
+    }
+)
+
+camera.configure(camera_config)
+
+camera.start()
+
+time.sleep(2)
+
+print("Camera started.")
+print("Camera format: RGB888")
+
+
+# Latest camera frame.
+# This is ALWAYS stored as RGB.
+latest_frame = None
+
+frame_lock = threading.Lock()
+
+
+# ============================================================
+# LOAD MODEL 1
+# ============================================================
+
+print("")
+print("Loading MobileNetV3 model...")
+
+model1 = Interpreter(
+    model_path=MODEL_1_PATH
+)
+
+model1.allocate_tensors()
+
+model1_input_details = model1.get_input_details()
+model1_output_details = model1.get_output_details()
+
+
+print(
+    "MobileNetV3 input:",
+    model1_input_details[0]["shape"],
+    model1_input_details[0]["dtype"]
+)
+
+print(
+    "MobileNetV3 output:",
+    model1_output_details[0]["shape"],
+    model1_output_details[0]["dtype"]
+)
+
+
+# ============================================================
+# LOAD MODEL 2
+# ============================================================
+
+print("")
+print("Loading pd_v1 model...")
+
+model2 = Interpreter(
+    model_path=MODEL_2_PATH
+)
+
+model2.allocate_tensors()
+
+model2_input_details = model2.get_input_details()
+model2_output_details = model2.get_output_details()
+
+
+print(
+    "pd_v1 input:",
+    model2_input_details[0]["shape"],
+    model2_input_details[0]["dtype"]
+)
+
+print(
+    "pd_v1 output:",
+    model2_output_details[0]["shape"],
+    model2_output_details[0]["dtype"]
+)
+
+
+# ============================================================
+# MODEL LOCKS
+# ============================================================
+
+model1_lock = threading.Lock()
+model2_lock = threading.Lock()
+
+
+# ============================================================
+# VALIDATE MODEL SHAPES
+# ============================================================
+
+def validate_model(model_name, input_details, output_details):
+
+    input_shape = tuple(
+        input_details[0]["shape"]
+    )
+
+    output_shape = tuple(
+        output_details[0]["shape"]
+    )
+
+    expected_input = (
+        1,
+        IMAGE_SIZE,
+        IMAGE_SIZE,
+        3
+    )
+
+    if input_shape != expected_input:
+
+        raise RuntimeError(
+            f"{model_name}: unexpected input shape "
+            f"{input_shape}. Expected {expected_input}."
+        )
+
+    output_size = int(
+        np.prod(output_shape)
+    )
+
+    if output_size != len(CLASS_NAMES):
+
+        raise RuntimeError(
+            f"{model_name}: expected "
+            f"{len(CLASS_NAMES)} output values, "
+            f"but model produces {output_size}."
+        )
+
+
+validate_model(
+    "MobileNetV3",
+    model1_input_details,
+    model1_output_details
+)
+
+validate_model(
+    "pd_v1",
+    model2_input_details,
+    model2_output_details
+)
+
+
+# ============================================================
+# CAMERA WORKER
+# ============================================================
+
+def camera_worker():
+
+    global latest_frame
+
+    print("Camera worker started.")
+
+    while True:
+
+        try:
+
+            # Picamera2 returns RGB because the camera
+            # configuration is explicitly RGB888.
+            frame = camera.capture_array(
+                "main"
+            )
+
+            with frame_lock:
+
+                latest_frame = frame.copy()
+
+        except Exception as e:
+
+            print(
+                "Camera error:",
+                e
+            )
+
+            time.sleep(0.1)
+
+
+camera_thread = threading.Thread(
+    target=camera_worker,
+    daemon=True
+)
+
+camera_thread.start()
+
+
+# ============================================================
+# GET CURRENT FRAME
+# ============================================================
+
+def get_current_frame():
+
+    with frame_lock:
+
+        if latest_frame is None:
+
+            return None
+
+        return latest_frame.copy()
+
+
+# ============================================================
+# PREPROCESSING
+# ============================================================
+
+def preprocess_image(
+    rgb_image,
+    input_details
+):
+    """
+    Exact training preprocessing:
+
+        RGB
+        ->
+        resize 224x224
+        ->
+        float32
+        ->
+        pixel / 255.0
+        ->
+        [1, 224, 224, 3]
+
+    Quantized models are handled using their
+    TFLite quantization parameters.
+    """
+
+    input_info = input_details[0]
+
+    input_shape = tuple(
+        input_info["shape"]
+    )
+
+    input_dtype = input_info["dtype"]
+
+
+    # --------------------------------------------------------
+    # Resize
+    # --------------------------------------------------------
+
+    image = cv2.resize(
+        rgb_image,
+        (
+            IMAGE_SIZE,
+            IMAGE_SIZE
+        ),
+        interpolation=cv2.INTER_AREA
+    )
+
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # The image is ALREADY RGB.
+    #
+    # DO NOT perform:
+    #
+    # cv2.cvtColor(
+    #     image,
+    #     cv2.COLOR_BGR2RGB
+    # )
+    #
+    # here.
+    # --------------------------------------------------------
+
+    image = image.astype(
+        np.float32
+    )
+
+
+    # --------------------------------------------------------
+    # EXACT TRAINING NORMALIZATION
+    # --------------------------------------------------------
+
+    image = image / 255.0
+
+
+    # --------------------------------------------------------
+    # Add batch dimension
+    # --------------------------------------------------------
+
+    image = np.expand_dims(
+        image,
+        axis=0
+    )
+
+
+    # --------------------------------------------------------
+    # FLOAT32 MODEL
+    # --------------------------------------------------------
+
+    if input_dtype == np.float32:
+
+        tensor = image.astype(
+            np.float32
+        )
+
+
+    # --------------------------------------------------------
+    # UINT8 MODEL
+    # --------------------------------------------------------
+
+    elif input_dtype == np.uint8:
+
+        scale, zero_point = (
+            input_info["quantization"]
+        )
+
+        if scale == 0:
+
+            raise RuntimeError(
+                "Invalid uint8 quantization scale."
+            )
+
+        tensor = np.round(
+            image / scale
+            + zero_point
+        )
+
+        tensor = np.clip(
+            tensor,
+            0,
+            255
+        ).astype(
+            np.uint8
+        )
+
+
+    # --------------------------------------------------------
+    # INT8 MODEL
+    # --------------------------------------------------------
+
+    elif input_dtype == np.int8:
+
+        scale, zero_point = (
+            input_info["quantization"]
+        )
+
+        if scale == 0:
+
+            raise RuntimeError(
+                "Invalid int8 quantization scale."
+            )
+
+        tensor = np.round(
+            image / scale
+            + zero_point
+        )
+
+        tensor = np.clip(
+            tensor,
+            -128,
+            127
+        ).astype(
+            np.int8
+        )
+
+
+    else:
+
+        raise RuntimeError(
+            f"Unsupported input dtype: "
+            f"{input_dtype}"
+        )
+
+
+    # --------------------------------------------------------
+    # Shape validation
+    # --------------------------------------------------------
+
+    if tuple(tensor.shape) != input_shape:
+
+        raise RuntimeError(
+            f"Input shape mismatch. "
+            f"Expected {input_shape}, "
+            f"got {tensor.shape}."
+        )
+
+
+    return tensor
+
+
+# ============================================================
+# OUTPUT DEQUANTIZATION
+# ============================================================
+
+def dequantize_output(
+    output,
+    output_details
+):
+    """
+    Converts quantized TFLite output back to
+    floating-point values.
+    """
+
+    output_info = output_details[0]
+
+    dtype = output_info["dtype"]
+
+
+    if dtype in (
+        np.uint8,
+        np.int8
+    ):
+
+        scale, zero_point = (
+            output_info["quantization"]
+        )
+
+        if scale != 0:
+
+            output = (
+                output.astype(
+                    np.float32
+                )
+                - zero_point
+            ) * scale
+
+        else:
+
+            output = output.astype(
+                np.float32
+            )
+
+    else:
+
+        output = output.astype(
+            np.float32
+        )
+
+
+    return output
+
+
+# ============================================================
+# SOFTMAX
+# ============================================================
+
+def softmax(values):
+
+    values = np.asarray(
+        values,
+        dtype=np.float32
+    )
+
+    values = (
+        values
+        - np.max(values)
+    )
+
+    exponentials = np.exp(
+        values
+    )
+
+    total = np.sum(
+        exponentials
+    )
+
+    if total <= 0:
+
+        raise RuntimeError(
+            "Softmax produced invalid output."
+        )
+
+    return (
+        exponentials / total
+    )
+
+
+# ============================================================
+# OUTPUT -> PROBABILITIES
+# ============================================================
+
+def output_to_probabilities(
+    output
+):
+    """
+    Handles both:
+
+    A) Models whose final layer is softmax:
+
+       [0.01, 0.02, 0.91, ...]
+
+    B) Models whose output is logits:
+
+       [-2.1, 0.3, 5.7, ...]
+
+    Softmax is ONLY applied when the output does not
+    already look like a probability distribution.
+    """
+
+    output = np.asarray(
+        output,
+        dtype=np.float32
+    )
+
+    output = np.squeeze(
+        output
+    )
+
+    output = output.reshape(
+        -1
+    )
+
+
+    # --------------------------------------------------------
+    # Validate number of classes
+    # --------------------------------------------------------
+
+    if len(output) != len(
+        CLASS_NAMES
+    ):
+
+        raise RuntimeError(
+            f"Model returned "
+            f"{len(output)} outputs. "
+            f"Expected "
+            f"{len(CLASS_NAMES)}."
+        )
+
+
+    # --------------------------------------------------------
+    # Validate values
+    # --------------------------------------------------------
+
+    if not np.all(
+        np.isfinite(output)
+    ):
+
+        raise RuntimeError(
+            "Model produced NaN "
+            "or infinite values."
+        )
+
+
+    # --------------------------------------------------------
+    # Determine whether output already
+    # represents probabilities.
+    #
+    # A softmax output should:
+    #
+    #   0 <= p <= 1
+    #   sum(p) = 1
+    # --------------------------------------------------------
+
+    output_sum = float(
+        np.sum(output)
+    )
+
+    looks_like_probability = (
+        np.all(output >= 0.0)
+        and
+        np.all(output <= 1.0)
+        and
+        abs(
+            output_sum - 1.0
+        ) < 0.05
+    )
+
+
+    if looks_like_probability:
+
+        probabilities = output.copy()
+
+    else:
+
+        # Treat output as logits.
+        probabilities = softmax(
+            output
+        )
+
+
+    # --------------------------------------------------------
+    # Final normalization
+    # --------------------------------------------------------
+
+    probabilities = np.clip(
+        probabilities,
+        0.0,
+        1.0
+    )
+
+    probability_sum = np.sum(
+        probabilities
+    )
+
+    if probability_sum <= 0:
+
+        raise RuntimeError(
+            "Invalid probability distribution."
+        )
+
+    probabilities = (
+        probabilities
+        / probability_sum
+    )
+
+
+    return probabilities.astype(
+        np.float32
+    )
+
+
+# ============================================================
+# RUN ONE MODEL
+# ============================================================
+
+def run_model(
+    interpreter,
+    input_details,
+    output_details,
+    rgb_image
+):
+
+    # --------------------------------------------------------
+    # PREPROCESS
+    # --------------------------------------------------------
+
+    input_tensor = preprocess_image(
+        rgb_image,
+        input_details
+    )
+
+
+    # --------------------------------------------------------
+    # INPUT
+    # --------------------------------------------------------
+
+    interpreter.set_tensor(
+        input_details[0]["index"],
+        input_tensor
+    )
+
+
+    # --------------------------------------------------------
+    # INFERENCE
+    # --------------------------------------------------------
+
+    interpreter.invoke()
+
+
+    # --------------------------------------------------------
+    # RAW OUTPUT
+    # --------------------------------------------------------
+
+    raw_output = interpreter.get_tensor(
+        output_details[0]["index"]
+    )
+
+
+    # --------------------------------------------------------
+    # DEQUANTIZE
+    # --------------------------------------------------------
+
+    raw_output = dequantize_output(
+        raw_output,
+        output_details
+    )
+
+
+    # --------------------------------------------------------
+    # PROBABILITIES
+    # --------------------------------------------------------
+
+    probabilities = (
+        output_to_probabilities(
+            raw_output
+        )
+    )
+
+
+    return probabilities
+
+
+# ============================================================
+# ENSEMBLE
+# ============================================================
+
+def ensemble_prediction(
+    rgb_image
+):
+
+    # ========================================================
+    # MODEL 1
+    # MobileNetV3 Large
+    # Reported accuracy: 94%
+    # ========================================================
+
+    with model1_lock:
+
+        probs1 = run_model(
+            model1,
+            model1_input_details,
+            model1_output_details,
+            rgb_image
+        )
+
+
+    # ========================================================
+    # MODEL 2
+    # pd_v1
+    # Reported accuracy: 68%
+    # ========================================================
+
+    with model2_lock:
+
+        probs2 = run_model(
+            model2,
+            model2_input_details,
+            model2_output_details,
+            rgb_image
+        )
+
+
+    # ========================================================
+    # WEIGHTED ENSEMBLE
+    #
+    # MobileNetV3 = 80%
+    # pd_v1       = 20%
+    #
+    # This prevents the weaker model from overpowering
+    # the stronger model simply because it has a higher
+    # raw confidence.
+    # ========================================================
+
+    ensemble_probs = (
+        MODEL_1_WEIGHT * probs1
+        +
+        MODEL_2_WEIGHT * probs2
+    )
+
+
+    # Normalize
+    ensemble_probs = (
+        ensemble_probs
+        / np.sum(ensemble_probs)
+    )
+
+
+    # ========================================================
+    # FINAL PREDICTION
+    # ========================================================
+
+    predicted_index = int(
+        np.argmax(
+            ensemble_probs
+        )
+    )
+
+    predicted_class = (
+        CLASS_NAMES[
+            predicted_index
+        ]
+    )
+
+    final_confidence = float(
+        ensemble_probs[
+            predicted_index
+        ]
+    )
+
+
+    # ========================================================
+    # INDIVIDUAL MODEL RESULTS
+    # ========================================================
+
+    model1_index = int(
+        np.argmax(probs1)
+    )
+
+    model2_index = int(
+        np.argmax(probs2)
+    )
+
+
+    return {
+
+        "class":
+            predicted_class,
+
+        "index":
+            predicted_index,
+
+        "confidence":
+            final_confidence,
+
+        "ensemble":
+            ensemble_probs.tolist(),
+
+        "model1":
+            probs1.tolist(),
+
+        "model2":
+            probs2.tolist(),
+
+        "model1_prediction":
+            CLASS_NAMES[
+                model1_index
+            ],
+
+        "model1_confidence":
+            float(
+                probs1[
+                    model1_index
+                ]
+            ),
+
+        "model2_prediction":
+            CLASS_NAMES[
+                model2_index
+            ],
+
+        "model2_confidence":
+            float(
+                probs2[
+                    model2_index
+                ]
+            )
+    }
+
+
+# ============================================================
+# DISEASE INFORMATION
+# ============================================================
+
+DISEASE_INFO = {
+
+    "Potato Early Blight": {
+
+        "description":
+            "Early blight is a fungal disease that can cause "
+            "dark spots and ring-like patterns on potato leaves.",
+
+        "actions": [
+            "Remove badly affected leaves.",
+            "Avoid wetting the leaves when watering.",
+            "Improve air circulation around plants.",
+            "Remove infected plant debris.",
+            "Monitor nearby potato plants."
+        ]
+    },
+
+
+    "Potato Late Blight": {
+
+        "description":
+            "Late blight can cause dark or water-soaked-looking "
+            "lesions and may spread quickly in humid conditions.",
+
+        "actions": [
+            "Remove severely infected plant material.",
+            "Keep foliage as dry as possible.",
+            "Improve air circulation.",
+            "Avoid overcrowding plants.",
+            "Monitor surrounding plants."
+        ]
+    },
+
+
+    "Potato Healthy": {
+
+        "description":
+            "The model did not detect symptoms associated with "
+            "the potato diseases included in this system.",
+
+        "actions": [
+            "Continue monitoring the plant.",
+            "Maintain appropriate watering.",
+            "Maintain good air circulation.",
+            "Inspect leaves regularly."
+        ]
+    },
+
+
+    "Tomato Early Blight": {
+
+        "description":
+            "Early blight commonly produces dark lesions and "
+            "may create concentric ring patterns on tomato leaves.",
+
+        "actions": [
+            "Remove heavily affected leaves.",
+            "Avoid overhead watering.",
+            "Improve air circulation.",
+            "Remove infected plant debris.",
+            "Monitor nearby tomato plants."
+        ]
+    },
+
+
+    "Tomato Late Blight": {
+
+        "description":
+            "Late blight can produce dark or water-soaked lesions "
+            "and may spread rapidly in cool, humid conditions.",
+
+        "actions": [
+            "Remove severely affected plant material.",
+            "Avoid watering leaves directly.",
+            "Improve airflow around plants.",
+            "Remove infected debris.",
+            "Monitor nearby plants frequently."
+        ]
+    },
+
+
+    "Tomato Leaf Mold": {
+
+        "description":
+            "Tomato leaf mold commonly develops under humid "
+            "conditions and can affect tomato foliage.",
+
+        "actions": [
+            "Reduce excessive humidity where possible.",
+            "Increase ventilation.",
+            "Avoid wetting leaves.",
+            "Remove affected leaves.",
+            "Avoid overcrowding plants."
+        ]
+    },
+
+
+    "Tomato Septoria": {
+
+        "description":
+            "Septoria leaf spot commonly causes many small "
+            "circular spots on tomato leaves.",
+
+        "actions": [
+            "Remove badly affected lower leaves.",
+            "Avoid overhead irrigation.",
+            "Improve air circulation.",
+            "Remove fallen infected leaves.",
+            "Keep foliage as dry as possible."
+        ]
+    },
+
+
+    "Tomato Healthy": {
+
+        "description":
+            "The model did not detect symptoms associated with "
+            "the tomato diseases included in this system.",
+
+        "actions": [
+            "Continue regular plant inspection.",
+            "Maintain good watering practices.",
+            "Provide adequate airflow.",
+            "Monitor for changes in leaf appearance."
+        ]
+    }
+}
+
+
+# ============================================================
+# OPENROUTER AI
+# ============================================================
+
+def get_ai_advice(
+    disease,
+    confidence
+):
+
+    if not OPENROUTER_API_KEY:
+
+        return (
+            "AI advice is currently unavailable.\n\n"
+            "Set the OPENROUTER_API_KEY environment variable "
+            "to enable the AI plant-care assistant."
+        )
+
+
+    try:
+
+        from openai import OpenAI
+
+
+        client = OpenAI(
+
+            base_url=(
+                "https://openrouter.ai/api/v1"
+            ),
+
+            api_key=(
+                OPENROUTER_API_KEY
+            )
+        )
+
+
+        prompt = f"""
+You are a plant-care assistant.
+
+A Raspberry Pi plant disease detection system produced
+the following prediction:
+
+Detected condition: {disease}
+Model confidence: {confidence:.1f}%
+
+Give concise, practical advice for a normal plant owner.
+
+Explain:
+
+1. What the detected condition means.
+2. What they should do now.
+3. How they can reduce the chance of spreading it.
+4. General environmental practices that may help.
+
+Keep the answer easy to understand.
+
+Do not claim the computer vision prediction is guaranteed
+to be correct.
+
+Do not prescribe dangerous chemicals or provide unsafe
+pesticide dosages.
+
+Use short sections and bullet points.
+"""
+
+
+        response = client.chat.completions.create(
+
+            model=OPENROUTER_MODEL,
+
+            messages=[
+
+                {
+                    "role": "system",
+
+                    "content":
+                        "You are a concise agricultural "
+                        "plant-care assistant."
+                },
+
+                {
+                    "role": "user",
+
+                    "content":
+                        prompt
+                }
+            ],
+
+            temperature=0.2,
+
+            max_tokens=500
+        )
+
+
+        return (
+            response
+            .choices[0]
+            .message
+            .content
+        )
+
+
+    except Exception as e:
+
+        print(
+            "OpenRouter error:",
+            e
+        )
+
+        return (
+            "The AI plant-care service could not be reached.\n\n"
+            "Please check your OpenRouter API key and "
+            "internet connection."
+        )
+
+
+# ============================================================
+# CAMERA MJPEG STREAM
+# ============================================================
+
+def generate_camera_stream():
+
+    while True:
+
+        frame = get_current_frame()
+
+        if frame is None:
+
+            time.sleep(
+                0.05
+            )
+
+            continue
+
+        try:
+
+            # ------------------------------------------------
+            # CAMERA FRAME IS RGB.
+            #
+            # Do NOT convert RGB -> BGR.
+            #
+            # PIL accepts the RGB NumPy array directly.
+            # ------------------------------------------------
+
+            image = Image.fromarray(
+                frame,
+                "RGB"
+            )
+
+            buffer = BytesIO()
+
+            image.save(
+                buffer,
+                format="JPEG",
+                quality=JPEG_QUALITY
+            )
+
+            jpeg_bytes = buffer.getvalue()
+
+        except Exception as e:
+
+            print(
+                "JPEG encoding error:",
+                e
+            )
+
+            time.sleep(
+                0.05
+            )
+
+            continue
+
+
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n"
+            b"Cache-Control: no-cache\r\n"
+            b"Pragma: no-cache\r\n\r\n"
+            + jpeg_bytes
+            + b"\r\n"
+        )
+
+
+        # Prevent excessive CPU usage.
+        time.sleep(
+            1.0 / CAMERA_FPS
+        )
+
+
+# ============================================================
+# HTML
+# ============================================================
+
+HTML = r"""
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport"
+      content="width=device-width, initial-scale=1.0">
+
+<title>Plant Health Monitor</title>
+
+
+<style>
+
+* {
+    box-sizing: border-box;
+}
+
+
+body {
+
+    margin: 0;
+
+    font-family:
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        sans-serif;
+
+    background:
+        #08110c;
+
+    color:
+        #f3f7f4;
+}
+
+
+.header {
+
+    padding:
+        20px 25px;
+
+    background:
+        #0d1c13;
+
+    border-bottom:
+        1px solid #1d3927;
+}
+
+
+.header h1 {
+
+    margin: 0;
+
+    font-size:
+        26px;
+}
+
+
+.header p {
+
+    margin:
+        5px 0 0;
+
+    color:
+        #91a99a;
+}
+
+
+.container {
+
+    max-width:
+        1400px;
+
+    margin:
+        auto;
+
+    padding:
+        20px;
+}
+
+
+.grid {
+
+    display:
+        grid;
+
+    grid-template-columns:
+        minmax(0, 1.6fr)
+        minmax(300px, 0.8fr);
+
+    gap:
+        20px;
+}
+
+
+.card {
+
+    background:
+        #0d1a12;
+
+    border:
+        1px solid #1d3927;
+
+    border-radius:
+        16px;
+
+    padding:
+        18px;
+
+    box-shadow:
+        0 10px 30px
+        rgba(0,0,0,.2);
+}
+
+
+.card-title {
+
+    font-size:
+        18px;
+
+    font-weight:
+        700;
+
+    margin-bottom:
+        14px;
+}
+
+
+.camera {
+
+    width:
+        100%;
+
+    display:
+        block;
+
+    border-radius:
+        12px;
+
+    background:
+        black;
+
+    aspect-ratio:
+        16 / 9;
+
+    object-fit:
+        cover;
+}
+
+
+.capture {
+
+    width:
+        100%;
+
+    margin-top:
+        15px;
+
+    padding:
+        15px;
+
+    border:
+        none;
+
+    border-radius:
+        10px;
+
+    background:
+        #2fb344;
+
+    color:
+        white;
+
+    font-size:
+        17px;
+
+    font-weight:
+        700;
+
+    cursor:
+        pointer;
+}
+
+
+.capture:hover {
+
+    background:
+        #38c94f;
+}
+
+
+.capture:disabled {
+
+    background:
+        #555;
+
+    cursor:
+        wait;
+}
+
+
+.stats {
+
+    display:
+        grid;
+
+    grid-template-columns:
+        1fr 1fr;
+
+    gap:
+        10px;
+}
+
+
+.stat {
+
+    padding:
+        15px;
+
+    border-radius:
+        12px;
+
+    background:
+        #122319;
+}
+
+
+.stat-label {
+
+    font-size:
+        12px;
+
+    color:
+        #8ea798;
+}
+
+
+.stat-value {
+
+    margin-top:
+        5px;
+
+    font-size:
+        21px;
+
+    font-weight:
+        700;
+}
+
+
+.result {
+
+    display:
+        none;
+
+    margin-top:
+        20px;
+}
+
+
+.result-name {
+
+    font-size:
+        29px;
+
+    font-weight:
+        800;
+
+    margin-bottom:
+        5px;
+}
+
+
+.confidence {
+
+    font-size:
+        17px;
+
+    color:
+        #8fd19e;
+}
+
+
+.bar {
+
+    height:
+        12px;
+
+    background:
+        #1b3022;
+
+    border-radius:
+        20px;
+
+    overflow:
+        hidden;
+
+    margin:
+        10px 0 20px;
+}
+
+
+.bar-inner {
+
+    height:
+        100%;
+
+    width:
+        0%;
+
+    background:
+        #42c95a;
+
+    transition:
+        width .5s ease;
+}
+
+
+.description {
+
+    line-height:
+        1.6;
+
+    color:
+        #c7d6cc;
+}
+
+
+.actions {
+
+    margin-top:
+        15px;
+}
+
+
+.actions li {
+
+    margin-bottom:
+        8px;
+}
+
+
+.ai {
+
+    margin-top:
+        18px;
+
+    padding:
+        15px;
+
+    background:
+        #13241a;
+
+    border-radius:
+        12px;
+
+    line-height:
+        1.6;
+
+    white-space:
+        pre-wrap;
+}
+
+
+.loading {
+
+    display:
+        none;
+
+    color:
+        #8ea798;
+
+    margin-top:
+        10px;
+}
+
+
+.small {
+
+    color:
+        #78907e;
+
+    font-size:
+        12px;
+
+    margin-top:
+        15px;
+
+    line-height:
+        1.5;
+}
+
+
+.model-box {
+
+    margin-top:
+        10px;
+
+    padding:
+        12px;
+
+    background:
+        #122319;
+
+    border-radius:
+        10px;
+}
+
+
+@media(max-width: 900px) {
+
+    .grid {
+
+        grid-template-columns:
+            1fr;
+    }
+
+}
+
+</style>
+
+</head>
+
+
+<body>
+
+
+<div class="header">
+
+    <h1>
+         Plant Health Monitor
+    </h1>
+
+    <p>
+        Raspberry Pi Plant Disease Detection System
+    </p>
+
+</div>
+
+
+<div class="container">
+
+
+<div class="grid">
+
+
+<!-- ======================================================
+     LEFT SIDE
+     ====================================================== -->
+
+
+<div>
+
+
+<div class="card">
+
+
+    <div class="card-title">
+         Live Raspberry Pi Camera
+    </div>
+
+
+    <img
+        class="camera"
+        src="/video_feed"
+        alt="Raspberry Pi Camera"
+    >
+
+
+    <button
+        class="capture"
+        id="captureButton"
+        onclick="captureImage()"
+    >
+
+         Capture & Diagnose
+
+    </button>
+
+
+    <div
+        class="loading"
+        id="loading"
+    >
+
+         Running both AI models...
+
+    </div>
+
+
+</div>
+
+
+<!-- ======================================================
+     RESULT
+     ====================================================== -->
+
+
+<div
+    class="card result"
+    id="result"
+>
+
+
+    <div class="card-title">
+         Detection Result
+    </div>
+
+
+    <div
+        class="result-name"
+        id="disease"
+    >
+    </div>
+
+
+    <div
+        class="confidence"
+        id="confidence"
+    >
+    </div>
+
+
+    <div class="bar">
+
+        <div
+            class="bar-inner"
+            id="confidenceBar"
+        >
+        </div>
+
+    </div>
+
+
+    <p
+        class="description"
+        id="description"
+    >
+    </p>
+
+
+    <div class="actions">
+
+        <strong>
+             Recommended Actions
+        </strong>
+
+
+        <ul id="actions">
+        </ul>
+
+    </div>
+
+
+    <div class="ai">
+
+        <strong>
+             AI Plant-Care Assistant
+        </strong>
+
+
+        <div
+            id="aiAdvice"
+            style="margin-top:10px"
+        >
+
+            Waiting for diagnosis...
+
+        </div>
+
+    </div>
+
+
+</div>
+
+
+</div>
+
+
+<!-- ======================================================
+     RIGHT SIDE
+     ====================================================== -->
+
+
+<div>
+
+
+<div class="card">
+
+
+    <div class="card-title">
+         Environment
+    </div>
+
+
+    <div class="stats">
+
+
+        <div class="stat">
+
+            <div class="stat-label">
+                Temperature
+            </div>
+
+            <div
+                class="stat-value"
+                id="temperature"
+            >
+
+                27.4C
+
+            </div>
+
+        </div>
+
+
+        <div class="stat">
+
+            <div class="stat-label">
+                Humidity
+            </div>
+
+            <div
+                class="stat-value"
+                id="humidity"
+            >
+
+                68%
+
+            </div>
+
+        </div>
+
+
+        <div class="stat">
+
+            <div class="stat-label">
+                Time
+            </div>
+
+            <div
+                class="stat-value"
+                id="time"
+            >
+
+                --
+
+            </div>
+
+        </div>
+
+
+        <div class="stat">
+
+            <div class="stat-label">
+                Month
+            </div>
+
+            <div
+                class="stat-value"
+                id="month"
+            >
+
+                --
+
+            </div>
+
+        </div>
+
+
+    </div>
+
+
+</div>
+
+
+<div
+    class="card"
+    style="margin-top:20px"
+>
+
+
+    <div class="card-title">
+         Detection System
+    </div>
+
+
+    <div class="model-box">
+
+        <strong>
+            MobileNetV3 Large
+        </strong>
+
+        <br>
+
+        Reported accuracy:
+        <strong>94%</strong>
+
+        <br>
+
+        Ensemble weight:
+        <strong>80%</strong>
+
+    </div>
+
+
+    <div class="model-box">
+
+        <strong>
+            pd_v1
+        </strong>
+
+        <br>
+
+        Reported accuracy:
+        <strong>68%</strong>
+
+        <br>
+
+        Ensemble weight:
+        <strong>20%</strong>
+
+    </div>
+
+
+    <div class="small">
+
+        The two models are combined using weighted
+        probability averaging. The stronger MobileNetV3
+        model has substantially greater influence.
+
+    </div>
+
+
+</div>
+
+
+</div>
+
+
+</div>
+
+
+</div>
+
+
+<script>
+
+
+// ==========================================================
+// CLOCK
+// ==========================================================
+
+function updateClock() {
+
+    const now = new Date();
+
+
+    document.getElementById(
+        "time"
+    ).innerText =
+
+        now.toLocaleTimeString(
+            [],
+            {
+                hour:
+                    "2-digit",
+
+                minute:
+                    "2-digit",
+
+                second:
+                    "2-digit"
+            }
+        );
+
+
+    document.getElementById(
+        "month"
+    ).innerText =
+
+        now.toLocaleString(
+            [],
+            {
+                month:
+                    "long"
+            }
+        );
+
+}
+
+
+setInterval(
+    updateClock,
+    1000
+);
+
+
+updateClock();
+
+
+// ==========================================================
+// CAPTURE + PREDICT
+// ==========================================================
+
+async function captureImage() {
+
+
+    const button =
+        document.getElementById(
+            "captureButton"
+        );
+
+
+    const loading =
+        document.getElementById(
+            "loading"
+        );
+
+
+    const result =
+        document.getElementById(
+            "result"
+        );
+
+
+    button.disabled = true;
+
+    loading.style.display =
+        "block";
+
+    result.style.display =
+        "none";
+
+
+    try {
+
+
+        const response =
+            await fetch(
+                "/predict",
+                {
+                    method:
+                        "POST"
+                }
+            );
+
+
+        const data =
+            await response.json();
+
+
+        if (!response.ok) {
+
+            throw new Error(
+                data.error ||
+                "Prediction failed."
+            );
+
+        }
+
+
+        // --------------------------------------------------
+        // Disease
+        // --------------------------------------------------
+
+        document.getElementById(
+            "disease"
+        ).innerText =
+
+            data.disease;
+
+
+        // --------------------------------------------------
+        // Confidence
+        // --------------------------------------------------
+
+        document.getElementById(
+            "confidence"
+        ).innerText =
+
+            "Ensemble confidence: " +
+            data.confidence.toFixed(1) +
+            "%";
+
+
+        document.getElementById(
+            "confidenceBar"
+        ).style.width =
+
+            Math.min(
+                data.confidence,
+                100
+            ) +
+            "%";
+
+
+        // --------------------------------------------------
+        // Description
+        // --------------------------------------------------
+
+        document.getElementById(
+            "description"
+        ).innerText =
+
+            data.description;
+
+
+        // --------------------------------------------------
+        // Recommended actions
+        // --------------------------------------------------
+
+        const actions =
+            document.getElementById(
+                "actions"
+            );
+
+
+        actions.innerHTML = "";
+
+
+        data.actions.forEach(
+            function(action) {
+
+                const li =
+                    document.createElement(
+                        "li"
+                    );
+
+                li.innerText =
+                    action;
+
+                actions.appendChild(
+                    li
+                );
+
+            }
+        );
+
+
+        // --------------------------------------------------
+        // AI advice
+        // --------------------------------------------------
+
+        document.getElementById(
+            "aiAdvice"
+        ).innerText =
+
+            data.ai_advice;
+
+
+        // --------------------------------------------------
+        // Show result
+        // --------------------------------------------------
+
+        result.style.display =
+            "block";
+
+
+        result.scrollIntoView(
+            {
+                behavior:
+                    "smooth",
+
+                block:
+                    "start"
+            }
+        );
+
+
+    }
+
+
+    catch(error) {
+
+
+        alert(
+            "Prediction error:\n\n" +
+            error.message
+        );
+
+
+    }
+
+
+    finally {
+
+        button.disabled =
+            false;
+
+        loading.style.display =
+            "none";
+
+    }
+
+}
+
+
+</script>
+
+
+</body>
+
+</html>
+"""
+
+
+# ============================================================
+# HOME
+# ============================================================
+
+@app.route("/")
+def index():
+
+    return render_template_string(
+        HTML
+    )
+
+
+# ============================================================
+# CAMERA STREAM
+# ============================================================
+
+@app.route("/video_feed")
+def video_feed():
+
+    return Response(
+
+        generate_camera_stream(),
+
+        mimetype=(
+            "multipart/x-mixed-replace; "
+            "boundary=frame"
+        )
+    )
+
+
+# ============================================================
+# PREDICTION
+# ============================================================
+
+@app.route(
+    "/predict",
+    methods=["POST"]
+)
+def predict():
+
+    try:
+
+
+        # ----------------------------------------------------
+        # Get latest RGB camera frame
+        # ----------------------------------------------------
+
+        frame = get_current_frame()
+
+
+        if frame is None:
+
+            return jsonify({
+
+                "error":
+                    "Camera frame is not available."
+
+            }), 500
+
+
+        # ----------------------------------------------------
+        # IMPORTANT:
+        #
+        # This remains RGB.
+        # ----------------------------------------------------
+
+        rgb_image = frame.copy()
+
+
+        # ----------------------------------------------------
+        # Run ensemble
+        # ----------------------------------------------------
+
+        result = ensemble_prediction(
+            rgb_image
+        )
+
+
+        disease = result[
+            "class"
+        ]
+
+
+        confidence = (
+            result[
+                "confidence"
+            ] * 100
+        )
+
+
+        # ----------------------------------------------------
+        # Disease information
+        # ----------------------------------------------------
+
+        info = DISEASE_INFO.get(
+
+            disease,
+
+            {
+
+                "description":
+                    "The model detected a "
+                    "plant condition.",
+
+                "actions":
+                    []
+
+            }
+        )
+
+
+        # ----------------------------------------------------
+        # OpenRouter
+        # ----------------------------------------------------
+
+        ai_advice = get_ai_advice(
+
+            disease,
+
+            confidence
+
+        )
+
+
+        # ----------------------------------------------------
+        # Return JSON
+        # ----------------------------------------------------
+
+        return jsonify({
+
+            "disease":
+                disease,
+
+            "confidence":
+                confidence,
+
+
+            "description":
+                info[
+                    "description"
+                ],
+
+
+            "actions":
+                info[
+                    "actions"
+                ],
+
+
+            "ai_advice":
+                ai_advice,
+
+
+            "model1_prediction":
+                result[
+                    "model1_prediction"
+                ],
+
+
+            "model1_confidence":
+                result[
+                    "model1_confidence"
+                ] * 100,
+
+
+            "model2_prediction":
+                result[
+                    "model2_prediction"
+                ],
+
+
+            "model2_confidence":
+                result[
+                    "model2_confidence"
+                ] * 100,
+
+
+            "ensemble":
+                result[
+                    "ensemble"
+                ]
+
+        })
+
+
+    except Exception as e:
+
+
+        print(
+            "Prediction error:",
+            e
+        )
+
+
+        return jsonify({
+
+            "error":
+                str(e)
+
+        }), 500
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+
+
+    print("")
+    print("=" * 65)
+    print(
+        "RASPBERRY PI PLANT DISEASE DETECTION SYSTEM"
+    )
+    print("=" * 65)
+
+    print("")
+
+    print(
+        "Camera:",
+        "RGB888"
+    )
+
+    print(
+        "Resolution:",
+        f"{CAMERA_WIDTH}x{CAMERA_HEIGHT}"
+    )
+
+    print(
+        "Target FPS:",
+        CAMERA_FPS
+    )
+
+    print("")
+
+    print(
+        "Model 1:",
+        MODEL_1_PATH
+    )
+
+    print(
+        "Model 1 weight:",
+        MODEL_1_WEIGHT
+    )
+
+    print("")
+
+    print(
+        "Model 2:",
+        MODEL_2_PATH
+    )
+
+    print(
+        "Model 2 weight:",
+        MODEL_2_WEIGHT
+    )
+
+    print("")
+
+    if OPENROUTER_API_KEY:
+
+        print(
+            "OpenRouter:",
+            "CONFIGURED"
+        )
+
+    else:
+
+        print(
+            "OpenRouter:",
+            "NOT CONFIGURED"
+        )
+
+    print("")
+
+    print(
+        "Dashboard:"
+    )
+
+    print(
+        "http://<RASPBERRY_PI_IP>:5000"
+    )
+
+    print("")
+
+    print("=" * 65)
+    print("")
+
+
+    app.run(
+
+        host="0.0.0.0",
+
+        port=5000,
+
+        threaded=True,
+
+        debug=False
+    )
