@@ -1,0 +1,1703 @@
+import os
+import time
+import threading
+
+import cv2
+import numpy as np
+
+from flask import Flask, Response, render_template_string, jsonify, send_file
+from picamera2 import Picamera2
+from ai_edge_litert.interpreter import Interpreter
+from PIL import Image
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+MODEL_1_PATH = os.path.join(
+    BASE_DIR,
+    "BEST_MODEL_MobileNetV3Large_raspi_fp16.tflite"
+)
+
+MODEL_2_PATH = os.path.join(
+    BASE_DIR,
+    "pd_v1.tflite"
+)
+
+CAPTURE_DIR = os.path.join(
+    BASE_DIR,
+    "captured_images"
+)
+
+os.makedirs(CAPTURE_DIR, exist_ok=True)
+
+
+IMAGE_SIZE = 224
+
+MODEL_1_WEIGHT = 0.80
+MODEL_2_WEIGHT = 0.20
+
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 720
+CAMERA_FPS = 30
+
+JPEG_QUALITY = 85
+
+
+# ============================================================
+# CLASS NAMES
+# Must match the training output order
+# ============================================================
+
+CLASS_NAMES = [
+    "Potato Early Blight",
+    "Potato Late Blight",
+    "Potato Healthy",
+    "Tomato Early Blight",
+    "Tomato Late Blight",
+    "Tomato Leaf Mold",
+    "Tomato Septoria",
+    "Tomato Healthy"
+]
+
+
+# ============================================================
+# FLASK
+# ============================================================
+
+app = Flask(__name__)
+
+
+# ============================================================
+# GLOBAL CAMERA FRAME
+# ============================================================
+
+latest_frame = None
+frame_lock = threading.Lock()
+
+
+# ============================================================
+# MODEL LOCKS
+# ============================================================
+
+model1_lock = threading.Lock()
+model2_lock = threading.Lock()
+
+
+# ============================================================
+# CHECK MODEL FILES
+# ============================================================
+
+if not os.path.exists(MODEL_1_PATH):
+    raise FileNotFoundError(
+        f"Model 1 not found:\n{MODEL_1_PATH}"
+    )
+
+if not os.path.exists(MODEL_2_PATH):
+    raise FileNotFoundError(
+        f"Model 2 not found:\n{MODEL_2_PATH}"
+    )
+
+
+print("=" * 60)
+print("PLANT DISEASE DETECTION SYSTEM")
+print("=" * 60)
+
+print(f"Model 1: {MODEL_1_PATH}")
+print(f"Model 2: {MODEL_2_PATH}")
+print(f"Images:  {CAPTURE_DIR}")
+
+
+# ============================================================
+# LOAD MODEL 1
+# ============================================================
+
+print("\nLoading Model 1...")
+
+model1 = Interpreter(
+    model_path=MODEL_1_PATH
+)
+
+model1.allocate_tensors()
+
+model1_input_details = model1.get_input_details()
+model1_output_details = model1.get_output_details()
+
+print("[OK] Model 1 loaded")
+
+print(
+    "Input:",
+    model1_input_details[0]["shape"],
+    model1_input_details[0]["dtype"]
+)
+
+print(
+    "Output:",
+    model1_output_details[0]["shape"],
+    model1_output_details[0]["dtype"]
+)
+
+
+# ============================================================
+# LOAD MODEL 2
+# ============================================================
+
+print("\nLoading Model 2...")
+
+model2 = Interpreter(
+    model_path=MODEL_2_PATH
+)
+
+model2.allocate_tensors()
+
+model2_input_details = model2.get_input_details()
+model2_output_details = model2.get_output_details()
+
+print("[OK] Model 2 loaded")
+
+print(
+    "Input:",
+    model2_input_details[0]["shape"],
+    model2_input_details[0]["dtype"]
+)
+
+print(
+    "Output:",
+    model2_output_details[0]["shape"],
+    model2_output_details[0]["dtype"]
+)
+
+
+# ============================================================
+# VALIDATE MODELS
+# ============================================================
+
+def validate_model(
+    model_name,
+    input_details,
+    output_details
+):
+
+    input_shape = tuple(
+        input_details[0]["shape"]
+    )
+
+    expected_shape = (
+        1,
+        IMAGE_SIZE,
+        IMAGE_SIZE,
+        3
+    )
+
+    if input_shape != expected_shape:
+
+        raise RuntimeError(
+            f"{model_name} input shape is "
+            f"{input_shape}. Expected "
+            f"{expected_shape}."
+        )
+
+    output_shape = tuple(
+        output_details[0]["shape"]
+    )
+
+    output_size = int(
+        np.prod(output_shape)
+    )
+
+    if output_size != len(CLASS_NAMES):
+
+        raise RuntimeError(
+            f"{model_name} produces "
+            f"{output_size} outputs, but "
+            f"{len(CLASS_NAMES)} classes are defined."
+        )
+
+
+validate_model(
+    "Model 1",
+    model1_input_details,
+    model1_output_details
+)
+
+validate_model(
+    "Model 2",
+    model2_input_details,
+    model2_output_details
+)
+
+print("[OK] Model validation complete")
+
+
+# ============================================================
+# CAMERA
+# ============================================================
+
+print("\nInitializing camera...")
+
+camera = Picamera2()
+
+camera_config = camera.create_video_configuration(
+    main={
+        "size": (
+            CAMERA_WIDTH,
+            CAMERA_HEIGHT
+        ),
+        "format": "RGB888"
+    },
+    controls={
+        "FrameRate": CAMERA_FPS,
+        "AwbEnable": False,
+        "ColourGains": (
+            2.0,
+            1.0
+        )
+    }
+)
+
+camera.configure(camera_config)
+
+camera.start()
+
+time.sleep(3)
+
+print("[OK] Camera started")
+
+
+# ============================================================
+# CAMERA WORKER
+# ============================================================
+
+def camera_worker():
+
+    global latest_frame
+
+    print("[OK] Camera worker started")
+
+    while True:
+
+        try:
+
+            frame = camera.capture_array("main")
+
+            with frame_lock:
+
+                latest_frame = frame.copy()
+
+        except Exception as e:
+
+            print(
+                "[CAMERA ERROR]",
+                e
+            )
+
+            time.sleep(0.1)
+
+
+camera_thread = threading.Thread(
+    target=camera_worker,
+    daemon=True
+)
+
+camera_thread.start()
+
+
+# ============================================================
+# GET CURRENT FRAME
+# ============================================================
+
+def get_current_frame():
+
+    with frame_lock:
+
+        if latest_frame is None:
+            return None
+
+        return latest_frame.copy()
+
+
+# ============================================================
+# GET NEXT IMAGE NUMBER
+# ============================================================
+
+def get_next_image_number():
+
+    numbers = []
+
+    for filename in os.listdir(CAPTURE_DIR):
+
+        if (
+            filename.startswith("image_")
+            and filename.lower().endswith(".jpg")
+        ):
+
+            number_text = filename[
+                len("image_"):
+                -len(".jpg")
+            ]
+
+            try:
+
+                number = int(number_text)
+                numbers.append(number)
+
+            except ValueError:
+
+                pass
+
+    if not numbers:
+        return 1
+
+    return max(numbers) + 1
+
+
+# ============================================================
+# SAVE A SPECIFIC FRAME
+# ============================================================
+#
+# IMPORTANT:
+# This function receives the exact frame that will also
+# be sent to the model.
+#
+# ============================================================
+
+def save_frame(frame):
+
+    if frame is None:
+
+        raise RuntimeError(
+            "Camera frame is not available."
+        )
+
+    image_number = get_next_image_number()
+
+    filename = (
+        f"image_{image_number:04d}.jpg"
+    )
+
+    filepath = os.path.join(
+        CAPTURE_DIR,
+        filename
+    )
+
+    image = Image.fromarray(
+        frame,
+        "RGB"
+    )
+
+    image.save(
+        filepath,
+        format="JPEG",
+        quality=95
+    )
+
+    return filename, filepath
+
+
+# ============================================================
+# PREPROCESSING
+# ============================================================
+
+def preprocess_image(
+    rgb_image,
+    input_details
+):
+
+    input_info = input_details[0]
+
+    input_shape = tuple(
+        input_info["shape"]
+    )
+
+    input_dtype = input_info["dtype"]
+
+
+    # Resize
+
+    image = cv2.resize(
+        rgb_image,
+        (
+            IMAGE_SIZE,
+            IMAGE_SIZE
+        ),
+        interpolation=cv2.INTER_AREA
+    )
+
+
+    # Convert to float
+
+    image = image.astype(
+        np.float32
+    )
+
+
+    # Normalize
+
+    image = image / 255.0
+
+
+    # Add batch dimension
+
+    image = np.expand_dims(
+        image,
+        axis=0
+    )
+
+
+    # Float32
+
+    if input_dtype == np.float32:
+
+        tensor = image.astype(
+            np.float32
+        )
+
+
+    # UINT8
+
+    elif input_dtype == np.uint8:
+
+        scale, zero_point = (
+            input_info["quantization"]
+        )
+
+        if scale == 0:
+
+            raise RuntimeError(
+                "Invalid UINT8 quantization scale."
+            )
+
+        tensor = np.round(
+            image / scale
+            + zero_point
+        )
+
+        tensor = np.clip(
+            tensor,
+            0,
+            255
+        ).astype(
+            np.uint8
+        )
+
+
+    # INT8
+
+    elif input_dtype == np.int8:
+
+        scale, zero_point = (
+            input_info["quantization"]
+        )
+
+        if scale == 0:
+
+            raise RuntimeError(
+                "Invalid INT8 quantization scale."
+            )
+
+        tensor = np.round(
+            image / scale
+            + zero_point
+        )
+
+        tensor = np.clip(
+            tensor,
+            -128,
+            127
+        ).astype(
+            np.int8
+        )
+
+
+    else:
+
+        raise RuntimeError(
+            f"Unsupported input dtype: "
+            f"{input_dtype}"
+        )
+
+
+    if tuple(tensor.shape) != input_shape:
+
+        raise RuntimeError(
+            f"Input shape mismatch. "
+            f"Expected {input_shape}, "
+            f"got {tensor.shape}."
+        )
+
+
+    return tensor
+
+
+# ============================================================
+# OUTPUT DEQUANTIZATION
+# ============================================================
+
+def dequantize_output(
+    output,
+    output_details
+):
+
+    output_info = output_details[0]
+
+    dtype = output_info["dtype"]
+
+
+    if dtype in (
+        np.uint8,
+        np.int8
+    ):
+
+        scale, zero_point = (
+            output_info["quantization"]
+        )
+
+        if scale != 0:
+
+            output = (
+                output.astype(np.float32)
+                - zero_point
+            ) * scale
+
+        else:
+
+            output = output.astype(
+                np.float32
+            )
+
+    else:
+
+        output = output.astype(
+            np.float32
+        )
+
+
+    return output
+
+
+# ============================================================
+# SOFTMAX
+# ============================================================
+
+def softmax(values):
+
+    values = np.asarray(
+        values,
+        dtype=np.float32
+    )
+
+    values = (
+        values -
+        np.max(values)
+    )
+
+    exponentials = np.exp(values)
+
+    total = np.sum(exponentials)
+
+    if total <= 0:
+
+        raise RuntimeError(
+            "Invalid softmax output."
+        )
+
+    return exponentials / total
+
+
+# ============================================================
+# OUTPUT TO PROBABILITIES
+# ============================================================
+
+def output_to_probabilities(output):
+
+    output = np.asarray(
+        output,
+        dtype=np.float32
+    )
+
+    output = np.squeeze(output)
+
+    output = output.reshape(-1)
+
+
+    if len(output) != len(CLASS_NAMES):
+
+        raise RuntimeError(
+            f"Model returned {len(output)} "
+            f"outputs. Expected "
+            f"{len(CLASS_NAMES)}."
+        )
+
+
+    if not np.all(
+        np.isfinite(output)
+    ):
+
+        raise RuntimeError(
+            "Model produced invalid output."
+        )
+
+
+    output_sum = float(
+        np.sum(output)
+    )
+
+
+    looks_like_probability = (
+
+        np.all(output >= 0.0)
+        and
+        np.all(output <= 1.0)
+        and
+        abs(output_sum - 1.0) < 0.05
+    )
+
+
+    if looks_like_probability:
+
+        probabilities = output.copy()
+
+    else:
+
+        probabilities = softmax(output)
+
+
+    probabilities = np.clip(
+        probabilities,
+        0.0,
+        1.0
+    )
+
+
+    total = np.sum(probabilities)
+
+    if total <= 0:
+
+        raise RuntimeError(
+            "Invalid probability distribution."
+        )
+
+
+    probabilities = (
+        probabilities / total
+    )
+
+
+    return probabilities.astype(
+        np.float32
+    )
+
+
+# ============================================================
+# RUN ONE MODEL
+# ============================================================
+
+def run_model(
+    interpreter,
+    input_details,
+    output_details,
+    rgb_image
+):
+
+    input_tensor = preprocess_image(
+        rgb_image,
+        input_details
+    )
+
+
+    interpreter.set_tensor(
+        input_details[0]["index"],
+        input_tensor
+    )
+
+
+    interpreter.invoke()
+
+
+    raw_output = interpreter.get_tensor(
+        output_details[0]["index"]
+    )
+
+
+    raw_output = dequantize_output(
+        raw_output,
+        output_details
+    )
+
+
+    probabilities = (
+        output_to_probabilities(
+            raw_output
+        )
+    )
+
+
+    return probabilities
+
+
+# ============================================================
+# ENSEMBLE PREDICTION
+# ============================================================
+#
+# rgb_image is the EXACT image captured by the button.
+#
+# ============================================================
+
+def ensemble_prediction(rgb_image):
+
+
+    # --------------------------------------------------------
+    # MODEL 1
+    # --------------------------------------------------------
+
+    with model1_lock:
+
+        probs1 = run_model(
+            model1,
+            model1_input_details,
+            model1_output_details,
+            rgb_image
+        )
+
+
+    # --------------------------------------------------------
+    # MODEL 2
+    # --------------------------------------------------------
+
+    with model2_lock:
+
+        probs2 = run_model(
+            model2,
+            model2_input_details,
+            model2_output_details,
+            rgb_image
+        )
+
+
+    # --------------------------------------------------------
+    # WEIGHTED ENSEMBLE
+    # --------------------------------------------------------
+
+    ensemble_probs = (
+        MODEL_1_WEIGHT * probs1
+        +
+        MODEL_2_WEIGHT * probs2
+    )
+
+
+    ensemble_probs = (
+        ensemble_probs /
+        np.sum(ensemble_probs)
+    )
+
+
+    # --------------------------------------------------------
+    # FINAL CLASS
+    # --------------------------------------------------------
+
+    predicted_index = int(
+        np.argmax(ensemble_probs)
+    )
+
+    predicted_class = (
+        CLASS_NAMES[predicted_index]
+    )
+
+    final_confidence = float(
+        ensemble_probs[predicted_index]
+    )
+
+
+    # --------------------------------------------------------
+    # INDIVIDUAL MODEL RESULTS
+    # --------------------------------------------------------
+
+    model1_index = int(
+        np.argmax(probs1)
+    )
+
+    model2_index = int(
+        np.argmax(probs2)
+    )
+
+
+    return {
+
+        "class":
+            predicted_class,
+
+        "index":
+            predicted_index,
+
+        "confidence":
+            final_confidence,
+
+        "ensemble":
+            ensemble_probs.tolist(),
+
+        "model1_prediction":
+            CLASS_NAMES[model1_index],
+
+        "model1_confidence":
+            float(
+                probs1[model1_index]
+            ),
+
+        "model2_prediction":
+            CLASS_NAMES[model2_index],
+
+        "model2_confidence":
+            float(
+                probs2[model2_index]
+            )
+    }
+
+
+# ============================================================
+# CAMERA STREAM
+# ============================================================
+
+def generate_camera_stream():
+
+    while True:
+
+        frame = get_current_frame()
+
+        if frame is None:
+
+            time.sleep(0.05)
+
+            continue
+
+
+        bgr_frame = cv2.cvtColor(
+            frame,
+            cv2.COLOR_RGB2BGR
+        )
+
+
+        success, buffer = cv2.imencode(
+            ".jpg",
+            bgr_frame,
+            [
+                cv2.IMWRITE_JPEG_QUALITY,
+                JPEG_QUALITY
+            ]
+        )
+
+
+        if not success:
+            continue
+
+
+        jpg = buffer.tobytes()
+
+
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n"
+            + jpg
+            + b"\r\n"
+        )
+
+
+# ============================================================
+# WEBSITE
+# ============================================================
+
+HTML = """
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+>
+
+<title>Plant Disease Detection</title>
+
+
+<style>
+
+* {
+    box-sizing: border-box;
+}
+
+
+body {
+
+    margin: 0;
+
+    font-family:
+        Arial,
+        Helvetica,
+        sans-serif;
+
+    background: #f3f4f6;
+
+    color: #111827;
+}
+
+
+.container {
+
+    max-width: 1100px;
+
+    margin: auto;
+
+    padding: 25px;
+}
+
+
+h1 {
+
+    text-align: center;
+
+    margin-bottom: 8px;
+}
+
+
+.subtitle {
+
+    text-align: center;
+
+    color: #6b7280;
+
+    margin-bottom: 25px;
+}
+
+
+.card {
+
+    background: white;
+
+    padding: 20px;
+
+    border-radius: 15px;
+
+    box-shadow:
+        0 4px 15px
+        rgba(0,0,0,0.08);
+}
+
+
+.camera {
+
+    display: block;
+
+    width: 100%;
+
+    max-width: 900px;
+
+    margin: auto;
+
+    border-radius: 10px;
+
+    background: black;
+}
+
+
+.button-container {
+
+    text-align: center;
+}
+
+
+button {
+
+    margin-top: 20px;
+
+    padding:
+        14px
+        30px;
+
+    font-size: 18px;
+
+    font-weight: bold;
+
+    border: none;
+
+    border-radius: 8px;
+
+    cursor: pointer;
+
+    background: #2563eb;
+
+    color: white;
+}
+
+
+button:hover {
+
+    background: #1d4ed8;
+}
+
+
+button:disabled {
+
+    background: #9ca3af;
+
+    cursor: not-allowed;
+}
+
+
+.status {
+
+    text-align: center;
+
+    margin-top: 15px;
+
+    color: #6b7280;
+}
+
+
+.result {
+
+    display: none;
+
+    margin-top: 25px;
+}
+
+
+.result-grid {
+
+    display: grid;
+
+    grid-template-columns:
+        1fr 1fr;
+
+    gap: 25px;
+}
+
+
+.captured-image {
+
+    width: 100%;
+
+    border-radius: 10px;
+}
+
+
+.result-box {
+
+    padding: 20px;
+
+    background: #f9fafb;
+
+    border-radius: 10px;
+}
+
+
+.final-result {
+
+    font-size: 28px;
+
+    font-weight: bold;
+
+    margin:
+        15px
+        0;
+}
+
+
+.confidence {
+
+    font-size: 20px;
+
+    margin-bottom: 20px;
+}
+
+
+.model-result {
+
+    background: white;
+
+    padding: 12px;
+
+    margin-top: 10px;
+
+    border-radius: 8px;
+
+    border: 1px solid #e5e7eb;
+}
+
+
+.error {
+
+    color: #dc2626;
+
+    font-weight: bold;
+}
+
+
+@media(max-width: 750px) {
+
+    .result-grid {
+
+        grid-template-columns: 1fr;
+    }
+}
+
+</style>
+
+</head>
+
+
+<body>
+
+
+<div class="container">
+
+
+<h1>
+Plant Disease Detection
+</h1>
+
+
+<div class="subtitle">
+Raspberry Pi Camera and TFLite Models
+</div>
+
+
+<div class="card">
+
+
+<img
+    id="camera"
+    class="camera"
+    src="/video_feed"
+    alt="Camera"
+>
+
+
+<div class="button-container">
+
+
+<button
+    id="captureButton"
+    onclick="captureAndPredict()"
+>
+Capture and Predict
+</button>
+
+
+</div>
+
+
+<div
+    id="status"
+    class="status"
+>
+Ready
+</div>
+
+
+</div>
+
+
+<div
+    id="result"
+    class="result"
+>
+
+
+<div class="card">
+
+
+<div class="result-grid">
+
+
+<div>
+
+<h2>
+Captured Image
+</h2>
+
+
+<img
+    id="capturedImage"
+    class="captured-image"
+>
+
+
+</div>
+
+
+<div class="result-box">
+
+
+<h2>
+Prediction
+</h2>
+
+
+<div
+    id="mainPrediction"
+    class="final-result"
+>
+</div>
+
+
+<div
+    id="mainConfidence"
+    class="confidence"
+>
+</div>
+
+
+<div class="model-result">
+
+<strong>
+Model 1
+</strong>
+
+<div id="model1Result">
+</div>
+
+</div>
+
+
+<div class="model-result">
+
+<strong>
+Model 2
+</strong>
+
+<div id="model2Result">
+</div>
+
+</div>
+
+
+</div>
+
+
+</div>
+
+
+</div>
+
+
+</div>
+
+
+</div>
+
+
+<script>
+
+async function captureAndPredict() {
+
+
+    const button =
+        document.getElementById(
+            "captureButton"
+        );
+
+
+    const status =
+        document.getElementById(
+            "status"
+        );
+
+
+    const result =
+        document.getElementById(
+            "result"
+        );
+
+
+    button.disabled = true;
+
+
+    status.innerText =
+        "Capturing image and running prediction...";
+
+
+    result.style.display =
+        "none";
+
+
+    try {
+
+
+        const response =
+            await fetch(
+                "/capture",
+                {
+                    method: "POST"
+                }
+            );
+
+
+        const data =
+            await response.json();
+
+
+        if (!data.success) {
+
+            throw new Error(
+                data.error ||
+                "Prediction failed."
+            );
+        }
+
+
+        /*
+         * Display the EXACT image that was
+         * captured and classified.
+         */
+
+        document.getElementById(
+            "capturedImage"
+        ).src =
+            "/captured/" +
+            encodeURIComponent(
+                data.filename
+            ) +
+            "?t=" +
+            Date.now();
+
+
+        /*
+         * Ensemble result
+         */
+
+        document.getElementById(
+            "mainPrediction"
+        ).innerText =
+            data.result.class;
+
+
+        document.getElementById(
+            "mainConfidence"
+        ).innerText =
+            "Confidence: " +
+            (
+                data.result.confidence *
+                100
+            ).toFixed(2) +
+            "%";
+
+
+        /*
+         * Model 1
+         */
+
+        document.getElementById(
+            "model1Result"
+        ).innerText =
+
+            data.result.model1_prediction +
+            " - " +
+            (
+                data.result.model1_confidence *
+                100
+            ).toFixed(2) +
+            "%";
+
+
+        /*
+         * Model 2
+         */
+
+        document.getElementById(
+            "model2Result"
+        ).innerText =
+
+            data.result.model2_prediction +
+            " - " +
+            (
+                data.result.model2_confidence *
+                100
+            ).toFixed(2) +
+            "%";
+
+
+        result.style.display =
+            "block";
+
+
+        status.innerText =
+            "Prediction completed.";
+
+
+    }
+
+    catch(error) {
+
+        console.error(error);
+
+        status.innerHTML =
+            '<span class="error">' +
+            error.message +
+            '</span>';
+
+    }
+
+    finally {
+
+        button.disabled = false;
+
+    }
+
+}
+
+</script>
+
+
+</body>
+
+</html>
+"""
+
+
+# ============================================================
+# HOME PAGE
+# ============================================================
+
+@app.route("/")
+def index():
+
+    return render_template_string(
+        HTML
+    )
+
+
+# ============================================================
+# LIVE CAMERA
+# ============================================================
+
+@app.route("/video_feed")
+def video_feed():
+
+    return Response(
+        generate_camera_stream(),
+        mimetype=(
+            "multipart/x-mixed-replace;"
+            " boundary=frame"
+        )
+    )
+
+
+# ============================================================
+# CAPTURE AND PREDICT
+# ============================================================
+
+@app.route(
+    "/capture",
+    methods=["POST"]
+)
+def capture_and_predict():
+
+    try:
+
+        # ----------------------------------------------------
+        # GET ONE SPECIFIC FRAME
+        # ----------------------------------------------------
+        #
+        # This is the critical part.
+        #
+        # The variable "frame" is used for BOTH:
+        #
+        #   1. Saving the image
+        #   2. Running the model
+        #
+        # Therefore the model receives the exact image
+        # that was captured.
+        #
+        # ----------------------------------------------------
+
+        frame = get_current_frame()
+
+
+        if frame is None:
+
+            return jsonify({
+
+                "success": False,
+
+                "error":
+                    "Camera frame is not available."
+
+            }), 500
+
+
+        # ----------------------------------------------------
+        # SAVE EXACT FRAME
+        # ----------------------------------------------------
+
+        filename, filepath = save_frame(
+            frame
+        )
+
+
+        print("")
+        print("=" * 60)
+        print("CAPTURED IMAGE")
+        print("=" * 60)
+
+        print(
+            "Filename:",
+            filename
+        )
+
+        print(
+            "Path:",
+            filepath
+        )
+
+
+        # ----------------------------------------------------
+        # RUN MODELS ON THE EXACT SAME FRAME
+        # ----------------------------------------------------
+
+        print(
+            "Running model prediction..."
+        )
+
+
+        prediction = ensemble_prediction(
+            frame
+        )
+
+
+        print(
+            "Prediction:",
+            prediction["class"]
+        )
+
+        print(
+            "Confidence:",
+            f"{prediction['confidence'] * 100:.2f}%"
+        )
+
+        print("=" * 60)
+
+
+        # ----------------------------------------------------
+        # SEND RESULT TO WEBSITE
+        # ----------------------------------------------------
+
+        return jsonify({
+
+            "success": True,
+
+            "filename":
+                filename,
+
+            "result":
+                prediction
+
+        })
+
+
+    except Exception as e:
+
+        print(
+            "[PREDICTION ERROR]",
+            str(e)
+        )
+
+
+        return jsonify({
+
+            "success": False,
+
+            "error":
+                str(e)
+
+        }), 500
+
+
+# ============================================================
+# SERVE CAPTURED IMAGE
+# ============================================================
+
+@app.route(
+    "/captured/<filename>"
+)
+def captured_image(filename):
+
+    filepath = os.path.abspath(
+        os.path.join(
+            CAPTURE_DIR,
+            filename
+        )
+    )
+
+    capture_dir = os.path.abspath(
+        CAPTURE_DIR
+    )
+
+
+    if not filepath.startswith(
+        capture_dir + os.sep
+    ):
+
+        return (
+            "Invalid filename",
+            400
+        )
+
+
+    if not os.path.isfile(filepath):
+
+        return (
+            "Image not found",
+            404
+        )
+
+
+    return send_file(
+        filepath,
+        mimetype="image/jpeg"
+    )
+
+
+# ============================================================
+# START SERVER
+# ============================================================
+
+if __name__ == "__main__":
+
+    print("")
+    print("=" * 60)
+    print("SERVER READY")
+    print("=" * 60)
+
+    print("")
+    print(
+        "Open this address from another device:"
+    )
+
+    print(
+        "http://<RASPBERRY_PI_IP>:5000"
+    )
+
+    print("")
+    print(
+        "Captured images are stored in:"
+    )
+
+    print(
+        CAPTURE_DIR
+    )
+
+    print("")
+
+
+    app.run(
+        host="0.0.0.0",
+        port=5000,
+        debug=False,
+        threaded=True
+    )
