@@ -1,0 +1,985 @@
+import os
+import time
+import threading
+import base64
+from datetime import datetime
+
+import cv2
+import numpy as np
+from flask import Flask, Response, render_template_string, jsonify
+
+try:
+    from picamera2 import Picamera2
+    HAS_PICAMERA = True
+except ImportError:
+    HAS_PICAMERA = False
+
+try:
+    from ai_edge_litert.interpreter import Interpreter
+except ImportError:
+    try:
+        import tflite_runtime.interpreter as tflite
+        Interpreter = tflite.Interpreter
+    except ImportError:
+        from tensorflow.lite.python.interpreter import Interpreter
+
+from PIL import Image
+from io import BytesIO
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+MODEL_FILENAME = "yoloV8n.tflite"
+
+# Look for model in current directory or cloned repository folder
+MODEL_PATH = MODEL_FILENAME
+if not os.path.exists(MODEL_PATH):
+    repo_model_path = os.path.join("Plant_disease_detection_model", MODEL_FILENAME)
+    if os.path.exists(repo_model_path):
+        MODEL_PATH = repo_model_path
+
+IMAGE_SIZE = 224
+
+# Camera settings
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 720
+CAMERA_FPS = 30
+
+# JPEG quality for browser stream
+JPEG_QUALITY = 82
+
+# Environmental data
+DUMMY_TEMPERATURE = 27.4
+DUMMY_HUMIDITY = 68.0
+
+# OpenRouter
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = "google/gemma-4-31b-it:free"
+
+
+# ============================================================
+# CLASS NAMES (EXACT MATCHING TRAINING ORDER)
+# ============================================================
+
+CLASS_NAMES = [
+    "Potato Early Blight",
+    "Potato Late Blight",
+    "Potato Healthy",
+    "Tomato Early Blight",
+    "Tomato Late Blight",
+    "Tomato Leaf Mold",
+    "Tomato Septoria",
+    "Tomato Healthy",
+]
+
+
+# ============================================================
+# FLASK APP
+# ============================================================
+
+app = Flask(__name__)
+
+
+# ============================================================
+# LOAD YOLOV8N MODEL ONLY
+# ============================================================
+
+print(f"Loading YOLOv8n TFLite model from: {MODEL_PATH}...")
+
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError(f"Model file not found at '{MODEL_PATH}'. Please ensure '{MODEL_FILENAME}' exists.")
+
+model = Interpreter(model_path=MODEL_PATH)
+model.allocate_tensors()
+
+model_input_details = model.get_input_details()
+model_output_details = model.get_output_details()
+
+print("YOLOv8n Input Details:", model_input_details[0]["shape"], model_input_details[0]["dtype"])
+print("YOLOv8n Output Details:", model_output_details[0]["shape"], model_output_details[0]["dtype"])
+
+model_lock = threading.Lock()
+
+
+# ============================================================
+# CAMERA INITIALIZATION / WORKER
+# ============================================================
+
+camera = None
+latest_frame = None
+frame_lock = threading.Lock()
+
+if HAS_PICAMERA:
+    try:
+        print("Initializing Raspberry Pi Picamera2...")
+        camera = Picamera2()
+        camera_config = camera.create_video_configuration(
+            main={
+                "size": (CAMERA_WIDTH, CAMERA_HEIGHT),
+                "format": "RGB888"
+            },
+            controls={
+                "FrameRate": CAMERA_FPS
+            }
+        )
+        camera.configure(camera_config)
+        camera.start()
+        time.sleep(2)
+        print("Picamera2 started successfully.")
+    except Exception as e:
+        print("Picamera2 initialization error:", e)
+        camera = None
+
+
+def camera_worker():
+    global latest_frame
+
+    if camera is not None:
+        print("Picamera2 worker loop started.")
+        while True:
+            try:
+                # Picamera2 returns BGR array despite RGB888 setting
+                frame = camera.capture_array("main")
+                if frame is not None and frame.ndim == 3:
+                    if frame.shape[2] == 4:
+                        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
+                    elif frame.shape[2] == 3:
+                        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+                with frame_lock:
+                    latest_frame = frame.copy()
+            except Exception as e:
+                print("Camera worker error:", e)
+                time.sleep(0.1)
+    else:
+        print("Picamera2 unavailable. Using synthetic fallback generator for testing.")
+        # Fallback test camera generator if running without Pi hardware
+        while True:
+            # Generate dummy frame for testing
+            dummy = np.zeros((CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8)
+            # Add colored test pattern
+            cv2.putText(dummy, "Raspberry Pi Camera Stream", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2)
+            cv2.circle(dummy, (640, 360), 150, (0, 180, 50), -1)
+            cv2.putText(dummy, "YOLOv8n Active", (540, 370), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            
+            with frame_lock:
+                latest_frame = dummy.copy()
+            time.sleep(1.0 / CAMERA_FPS)
+
+
+camera_thread = threading.Thread(target=camera_worker, daemon=True)
+camera_thread.start()
+
+
+def get_current_frame():
+    with frame_lock:
+        if latest_frame is None:
+            return None
+        return latest_frame.copy()
+
+
+# ============================================================
+# PREPROCESSING FOR YOLOV8N
+# ============================================================
+
+def preprocess_image(rgb_image):
+    """
+    YOLOv8n classification model preprocessing:
+    - Resize RGB image to 224x224
+    - Normalize to [0.0, 1.0] (float32)
+    - Convert from HWC [224, 224, 3] -> NCHW [1, 3, 224, 224] if required by model shape
+    """
+    input_shape = tuple(model_input_details[0]["shape"])
+    input_dtype = model_input_details[0]["dtype"]
+
+    # 1. Resize image
+    image = cv2.resize(
+        rgb_image,
+        (IMAGE_SIZE, IMAGE_SIZE),
+        interpolation=cv2.INTER_AREA
+    )
+
+    # 2. Normalize pixel values to [0.0, 1.0]
+    image = image.astype(np.float32) / 255.0
+
+    # 3. Handle NCHW [1, 3, 224, 224] vs HWC [1, 224, 224, 3] layout
+    if len(input_shape) == 4 and input_shape[1] == 3:
+        # NCHW layout (Channels first)
+        image = np.transpose(image, (2, 0, 1))
+
+    # 4. Add batch dimension
+    tensor = np.expand_dims(image, axis=0).astype(input_dtype)
+
+    return tensor
+
+
+# ============================================================
+# OUTPUT PROBABILITIES
+# ============================================================
+
+def output_to_probabilities(raw_output):
+    output = np.asarray(raw_output, dtype=np.float32).squeeze()
+
+    if len(output) != len(CLASS_NAMES):
+        raise RuntimeError(f"YOLOv8n returned {len(output)} outputs, expected {len(CLASS_NAMES)}.")
+
+    # Check if outputs already sum to ~1.0 (Softmax output)
+    out_sum = float(np.sum(output))
+    is_softmax = np.all(output >= 0.0) and np.all(output <= 1.0) and abs(out_sum - 1.0) < 0.08
+
+    if is_softmax:
+        probs = output.copy()
+    else:
+        # Softmax for logits
+        shifted = output - np.max(output)
+        exp_vals = np.exp(shifted)
+        probs = exp_vals / np.sum(exp_vals)
+
+    probs = np.clip(probs, 0.0, 1.0)
+    probs = probs / np.sum(probs)
+    return probs.astype(np.float32)
+
+
+# ============================================================
+# YOLOV8N PREDICTION INFERENCE
+# ============================================================
+
+def run_yolov8n_prediction(rgb_image):
+    with model_lock:
+        input_tensor = preprocess_image(rgb_image)
+        model.set_tensor(model_input_details[0]["index"], input_tensor)
+        model.invoke()
+        raw_output = model.get_tensor(model_output_details[0]["index"])
+        probabilities = output_to_probabilities(raw_output)
+
+    predicted_index = int(np.argmax(probabilities))
+    predicted_class = CLASS_NAMES[predicted_index]
+    confidence = float(probabilities[predicted_index])
+
+    return {
+        "class": predicted_class,
+        "index": predicted_index,
+        "confidence": confidence,
+        "probabilities": probabilities.tolist()
+    }
+
+
+# ============================================================
+# DISEASE INFORMATION
+# ============================================================
+
+DISEASE_INFO = {
+    "Potato Early Blight": {
+        "description": "Early blight is a fungal disease causing dark brown spots with target-like concentric rings on potato foliage.",
+        "actions": [
+            "Remove heavily infected lower leaves.",
+            "Avoid overhead leaf watering.",
+            "Improve ventilation and plant spacing.",
+            "Clear infected plant debris.",
+            "Monitor nearby potato crops."
+        ]
+    },
+    "Potato Late Blight": {
+        "description": "Late blight is a destructive pathogen causing dark water-soaked lesions that spread rapidly in humid weather.",
+        "actions": [
+            "Prune infected plant parts immediately.",
+            "Keep foliage dry and increase airflow.",
+            "Avoid overcrowding plants.",
+            "Destroy fallen infected leaves."
+        ]
+    },
+    "Potato Healthy": {
+        "description": "The YOLOv8n model detected healthy potato leaves with no visible disease symptoms.",
+        "actions": [
+            "Maintain current watering schedule.",
+            "Ensure good air circulation.",
+            "Regularly inspect undersides of leaves."
+        ]
+    },
+    "Tomato Early Blight": {
+        "description": "Early blight causes brown/black leaf spots with characteristic ring patterns on tomato foliage.",
+        "actions": [
+            "Remove affected leaves from lower branches.",
+            "Water at the soil level, avoiding foliage.",
+            "Increase plant spacing for better airflow.",
+            "Clear fallen debris around the stem."
+        ]
+    },
+    "Tomato Late Blight": {
+        "description": "Late blight produces large pale-green to dark water-soaked spots that rapidly enlarge.",
+        "actions": [
+            "Promptly isolate or remove severely infected leaves.",
+            "Ensure foliage remains dry.",
+            "Increase sunlight exposure and ventilation."
+        ]
+    },
+    "Tomato Leaf Mold": {
+        "description": "Tomato leaf mold presents as yellow spots on top of leaves with olive-greenish mold underneath in high humidity.",
+        "actions": [
+            "Reduce humidity level in growing area.",
+            "Increase greenhouse/room ventilation.",
+            "Prune lower leaves to improve airflow."
+        ]
+    },
+    "Tomato Septoria": {
+        "description": "Septoria leaf spot produces numerous small, circular grey spots with dark borders.",
+        "actions": [
+            "Remove infected lower foliage.",
+            "Avoid splashing water on leaves.",
+            "Clean garden tools after handling infected plants."
+        ]
+    },
+    "Tomato Healthy": {
+        "description": "The YOLOv8n model detected clean, healthy tomato foliage with optimal green pigmentation.",
+        "actions": [
+            "Continue standard watering and feeding routine.",
+            "Ensure proper airflow and adequate light."
+        ]
+    }
+}
+
+
+# ============================================================
+# OPENROUTER AI ASSISTANT
+# ============================================================
+
+def get_ai_advice(disease, confidence):
+    if not OPENROUTER_API_KEY:
+        return (
+            "AI advice is currently offline.\n\n"
+            "Set the OPENROUTER_API_KEY environment variable to enable Gemma AI plant advice."
+        )
+
+    try:
+        from openai import OpenAI
+        client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=OPENROUTER_API_KEY
+        )
+
+        prompt = f"""
+You are an expert plant-care agricultural assistant.
+YOLOv8n plant disease classification model produced this prediction:
+
+Condition: {disease}
+Confidence: {confidence:.1f}%
+
+Provide short, actionable steps for a plant owner:
+1. Explain what this condition is.
+2. Immediate steps to take right now.
+3. Preventive practices to stop spread.
+Use concise bullet points.
+"""
+
+        response = client.chat.completions.create(
+            model=OPENROUTER_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a concise agricultural expert."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2,
+            max_tokens=450
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print("OpenRouter error:", e)
+        return "AI care assistant service could not be reached."
+
+
+# ============================================================
+# CAMERA MJPEG STREAM
+# ============================================================
+
+def generate_camera_stream():
+    while True:
+        frame = get_current_frame()
+        if frame is None:
+            time.sleep(0.05)
+            continue
+
+        try:
+            image = Image.fromarray(frame, "RGB")
+            buffer = BytesIO()
+            image.save(buffer, format="JPEG", quality=JPEG_QUALITY)
+            jpeg_bytes = buffer.getvalue()
+        except Exception as e:
+            print("JPEG encoding error:", e)
+            time.sleep(0.05)
+            continue
+
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n"
+            b"Cache-Control: no-cache\r\n"
+            b"Pragma: no-cache\r\n\r\n"
+            + jpeg_bytes
+            + b"\r\n"
+        )
+        time.sleep(1.0 / CAMERA_FPS)
+
+
+# ============================================================
+# HTML WEB DASHBOARD
+# ============================================================
+
+HTML = r"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>YOLOv8n Plant Health Monitor</title>
+
+<style>
+* { box-sizing: border-box; }
+body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #08110c;
+    color: #f3f7f4;
+}
+
+.header {
+    padding: 20px 25px;
+    background: #0d1c13;
+    border-bottom: 1px solid #1d3927;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+.header h1 { margin: 0; font-size: 24px; color: #42c95a; }
+.header p { margin: 4px 0 0; color: #91a99a; font-size: 14px; }
+
+.badge {
+    background: #193823;
+    border: 1px solid #2fb344;
+    color: #42c95a;
+    padding: 6px 14px;
+    border-radius: 20px;
+    font-size: 13px;
+    font-weight: 700;
+}
+
+.container {
+    max-width: 1400px;
+    margin: auto;
+    padding: 20px;
+}
+
+.grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.6fr) minmax(320px, 0.8fr);
+    gap: 20px;
+}
+
+.card {
+    background: #0d1a12;
+    border: 1px solid #1d3927;
+    border-radius: 16px;
+    padding: 18px;
+    box-shadow: 0 10px 30px rgba(0,0,0,.2);
+}
+
+.card-title {
+    font-size: 18px;
+    font-weight: 700;
+    margin-bottom: 14px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.camera {
+    width: 100%;
+    display: block;
+    border-radius: 12px;
+    background: black;
+    aspect-ratio: 16 / 9;
+    object-fit: cover;
+}
+
+.btn-group {
+    display: flex;
+    gap: 12px;
+    margin-top: 15px;
+}
+
+.capture-btn {
+    flex: 2;
+    padding: 14px;
+    border: none;
+    border-radius: 10px;
+    background: #2fb344;
+    color: white;
+    font-size: 16px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: background 0.2s ease;
+}
+.capture-btn:hover { background: #38c94f; }
+.capture-btn:disabled { background: #555; cursor: wait; }
+
+.toggle-btn {
+    flex: 1;
+    padding: 14px;
+    border: 1px solid #2fb344;
+    border-radius: 10px;
+    background: #12281b;
+    color: #42c95a;
+    font-size: 14px;
+    font-weight: 700;
+    cursor: pointer;
+    text-align: center;
+}
+.toggle-btn.active {
+    background: #2fb344;
+    color: white;
+}
+
+.stats {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+}
+
+.stat {
+    padding: 14px;
+    border-radius: 12px;
+    background: #122319;
+}
+.stat-label { font-size: 12px; color: #8ea798; }
+.stat-value { margin-top: 5px; font-size: 20px; font-weight: 700; }
+
+.result {
+    display: none;
+    margin-top: 20px;
+}
+
+.snapshot-container {
+    margin: 15px 0;
+    display: flex;
+    gap: 15px;
+    align-items: flex-start;
+}
+
+.snapshot-box {
+    flex: 1;
+    max-width: 220px;
+}
+
+.snapshot-img {
+    width: 100%;
+    border-radius: 10px;
+    border: 2px solid #2fb344;
+    background: #000;
+    aspect-ratio: 1;
+    object-fit: cover;
+}
+
+.result-header { flex: 2; }
+
+.result-name {
+    font-size: 28px;
+    font-weight: 800;
+    color: #42c95a;
+    margin-bottom: 5px;
+}
+
+.confidence { font-size: 16px; color: #8fd19e; }
+
+.bar {
+    height: 12px;
+    background: #1b3022;
+    border-radius: 20px;
+    overflow: hidden;
+    margin: 10px 0 15px;
+}
+
+.bar-inner {
+    height: 100%;
+    width: 0%;
+    background: #42c95a;
+    transition: width .4s ease;
+}
+
+.description { line-height: 1.6; color: #c7d6cc; margin-top: 12px; }
+
+.actions ul { margin: 8px 0 0; padding-left: 20px; }
+.actions li { margin-bottom: 6px; color: #d1e2d7; }
+
+.ai {
+    margin-top: 18px;
+    padding: 15px;
+    background: #13241a;
+    border-radius: 12px;
+    border-left: 4px solid #2fb344;
+    line-height: 1.6;
+    white-space: pre-wrap;
+}
+
+.loading {
+    display: none;
+    color: #42c95a;
+    margin-top: 12px;
+    font-weight: 600;
+    text-align: center;
+}
+
+.model-box {
+    margin-top: 10px;
+    padding: 14px;
+    background: #122319;
+    border-radius: 10px;
+    border: 1px solid #1e3a29;
+}
+
+.class-row { margin-bottom: 8px; }
+.class-info { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 3px; }
+.class-bar { height: 7px; background: #162a1e; border-radius: 10px; overflow: hidden; }
+.class-bar-fill { height: 100%; background: #268037; width: 0%; transition: width 0.3s ease; }
+.class-bar-fill.active { background: #42c95a; }
+
+@media(max-width: 900px) {
+    .grid { grid-template-columns: 1fr; }
+    .snapshot-container { flex-direction: column; }
+    .snapshot-box { max-width: 100%; }
+}
+</style>
+</head>
+
+<body>
+
+<div class="header">
+    <div>
+        <h1>Plant Health Monitor</h1>
+        <p>Raspberry Pi Real-Time YOLOv8n Disease Detector</p>
+    </div>
+    <div class="badge">Model: YOLOv8n TFLite</div>
+</div>
+
+<div class="container">
+<div class="grid">
+
+<!-- LEFT COLUMN -->
+<div>
+<div class="card">
+    <div class="card-title">Live Raspberry Pi Camera Feed</div>
+
+    <img class="camera" src="/video_feed" alt="Camera Stream">
+
+    <div class="btn-group">
+        <button class="capture-btn" id="captureBtn" onclick="captureImage()">
+            Capture & Diagnose
+        </button>
+        <button class="toggle-btn" id="realtimeToggle" onclick="toggleRealtime()">
+            Realtime: OFF
+        </button>
+    </div>
+
+    <div class="loading" id="loading">Running YOLOv8n inference...</div>
+</div>
+
+<!-- DIAGNOSIS RESULT CARD -->
+<div class="card result" id="resultCard">
+    <div class="card-title">Live Diagnosis Result</div>
+
+    <div class="snapshot-container">
+        <div class="snapshot-box">
+            <img id="capturedPreview" class="snapshot-img" src="" alt="Captured Frame">
+            <div style="font-size: 11px; color:#8ea798; text-align:center; margin-top:4px;">Inference Frame (224x224)</div>
+        </div>
+
+        <div class="result-header">
+            <div class="result-name" id="disease">--</div>
+            <div class="confidence" id="confidence">Confidence: --%</div>
+            <div class="bar"><div class="bar-inner" id="confidenceBar"></div></div>
+        </div>
+    </div>
+
+    <p class="description" id="description"></p>
+
+    <div class="actions">
+        <strong>Recommended Actions:</strong>
+        <ul id="actions"></ul>
+    </div>
+
+    <!-- 8 CLASS BREAKDOWN -->
+    <div style="margin-top: 20px;">
+        <strong style="font-size: 15px; color: #e0eee4;">YOLOv8n Class Probabilities:</strong>
+        <div id="classBreakdownList" style="margin-top: 10px;"></div>
+    </div>
+
+    <!-- AI Advice -->
+    <div class="ai">
+        <strong style="color: #42c95a;">AI Plant-Care Assistant:</strong>
+        <div id="aiAdvice" style="margin-top: 8px;">Waiting for diagnosis...</div>
+    </div>
+</div>
+</div>
+
+<!-- RIGHT COLUMN -->
+<div>
+
+<!-- Environment -->
+<div class="card">
+    <div class="card-title">Environment</div>
+    <div class="stats">
+        <div class="stat">
+            <div class="stat-label">Temperature</div>
+            <div class="stat-value">27.4°C</div>
+        </div>
+        <div class="stat">
+            <div class="stat-label">Humidity</div>
+            <div class="stat-value">68%</div>
+        </div>
+        <div class="stat">
+            <div class="stat-label">Time</div>
+            <div class="stat-value" id="time">--</div>
+        </div>
+        <div class="stat">
+            <div class="stat-label">Month</div>
+            <div class="stat-value" id="month">--</div>
+        </div>
+    </div>
+</div>
+
+<!-- Active Model Spec -->
+<div class="card" style="margin-top: 20px;">
+    <div class="card-title">Active AI Engine</div>
+    <div class="model-box">
+        <div style="font-weight:700; color:#42c95a; font-size:16px;">YOLOv8n Classification</div>
+        <div style="font-size:13px; color:#8ea798; margin-top:6px;">
+            Architecture: <strong>YOLOv8 Nano</strong><br>
+            Input Tensor: <strong>[1, 3, 224, 224] (Float32 NCHW)</strong><br>
+            Output Classes: <strong>8 Categories</strong><br>
+            Status: <strong style="color:#42c95a;">ACTIVE & RUNNING</strong>
+        </div>
+    </div>
+</div>
+
+</div>
+</div>
+</div>
+
+<script>
+const CLASS_NAMES = [
+    "Potato Early Blight",
+    "Potato Late Blight",
+    "Potato Healthy",
+    "Tomato Early Blight",
+    "Tomato Late Blight",
+    "Tomato Leaf Mold",
+    "Tomato Septoria",
+    "Tomato Healthy"
+];
+
+let isRealtimeActive = false;
+let realtimeTimer = null;
+
+function updateClock() {
+    const now = new Date();
+    document.getElementById("time").innerText = now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    document.getElementById("month").innerText = now.toLocaleString([], { month: "long" });
+}
+setInterval(updateClock, 1000);
+updateClock();
+
+function toggleRealtime() {
+    const btn = document.getElementById("realtimeToggle");
+    isRealtimeActive = !isRealtimeActive;
+
+    if (isRealtimeActive) {
+        btn.innerText = "Realtime: ON";
+        btn.classList.add("active");
+        captureImage();
+        realtimeTimer = setInterval(captureImage, 1200);
+    } else {
+        btn.innerText = "Realtime: OFF";
+        btn.classList.remove("active");
+        if (realtimeTimer) clearInterval(realtimeTimer);
+    }
+}
+
+async function captureImage() {
+    const btn = document.getElementById("captureBtn");
+    const loading = document.getElementById("loading");
+    const resultCard = document.getElementById("resultCard");
+
+    if (!isRealtimeActive) {
+        btn.disabled = true;
+        loading.style.display = "block";
+    }
+
+    try {
+        const response = await fetch("/predict", { method: "POST" });
+        const data = await response.json();
+
+        if (!response.ok) throw new Error(data.error || "Prediction failed.");
+
+        if (data.image_b64) {
+            document.getElementById("capturedPreview").src = data.image_b64;
+        }
+
+        document.getElementById("disease").innerText = data.disease;
+        document.getElementById("confidence").innerText = "Confidence: " + data.confidence.toFixed(1) + "%";
+        document.getElementById("confidenceBar").style.width = Math.min(data.confidence, 100) + "%";
+        document.getElementById("description").innerText = data.description;
+
+        const actionsList = document.getElementById("actions");
+        actionsList.innerHTML = "";
+        data.actions.forEach(act => {
+            const li = document.createElement("li");
+            li.innerText = act;
+            actionsList.appendChild(li);
+        });
+
+        // Probabilities breakdown
+        const breakdownContainer = document.getElementById("classBreakdownList");
+        breakdownContainer.innerHTML = "";
+
+        if (data.probabilities && data.probabilities.length === CLASS_NAMES.length) {
+            CLASS_NAMES.forEach((className, idx) => {
+                const probPct = (data.probabilities[idx] * 100).toFixed(1);
+                const isWinner = (className === data.disease);
+
+                const row = document.createElement("div");
+                row.className = "class-row";
+                row.innerHTML = `
+                    <div class="class-info">
+                        <span style="${isWinner ? 'font-weight:bold; color:#42c95a;' : 'color:#a0b8a8;'}">${className}</span>
+                        <span style="${isWinner ? 'font-weight:bold; color:#42c95a;' : 'color:#a0b8a8;'}">${probPct}%</span>
+                    </div>
+                    <div class="class-bar">
+                        <div class="class-bar-fill ${isWinner ? 'active' : ''}" style="width: ${probPct}%;"></div>
+                    </div>
+                `;
+                breakdownContainer.appendChild(row);
+            });
+        }
+
+        document.getElementById("aiAdvice").innerText = data.ai_advice;
+
+        if (resultCard.style.display !== "block") {
+            resultCard.style.display = "block";
+            resultCard.scrollIntoView({ behavior: "smooth", block: "start" });
+        }
+
+    } catch(err) {
+        if (!isRealtimeActive) alert("Prediction error:\n\n" + err.message);
+    } finally {
+        if (!isRealtimeActive) {
+            btn.disabled = false;
+            loading.style.display = "none";
+        }
+    }
+}
+</script>
+
+</body>
+</html>
+"""
+
+
+# ============================================================
+# HOME ROUTE
+# ============================================================
+
+@app.route("/")
+def index():
+    return render_template_string(HTML)
+
+
+# ============================================================
+# CAMERA MJPEG STREAM ROUTE
+# ============================================================
+
+@app.route("/video_feed")
+def video_feed():
+    return Response(
+        generate_camera_stream(),
+        mimetype="multipart/x-mixed-replace; boundary=frame"
+    )
+
+
+# ============================================================
+# PREDICTION ENDPOINT
+# ============================================================
+
+@app.route("/predict", methods=["POST"])
+def predict():
+    try:
+        frame = get_current_frame()
+
+        if frame is None:
+            return jsonify({"error": "Camera frame is not available."}), 500
+
+        rgb_image = frame.copy()
+
+        # Encode captured frame as base64 JPEG
+        pil_img = Image.fromarray(rgb_image, "RGB")
+        buf = BytesIO()
+        pil_img.save(buf, format="JPEG", quality=85)
+        img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        image_data_url = f"data:image/jpeg;base64,{img_b64}"
+
+        # Run YOLOv8n single model prediction
+        result = run_yolov8n_prediction(rgb_image)
+
+        disease = result["class"]
+        confidence = result["confidence"] * 100
+
+        info = DISEASE_INFO.get(
+            disease,
+            {
+                "description": "The YOLOv8n model detected a plant condition.",
+                "actions": []
+            }
+        )
+
+        ai_advice = get_ai_advice(disease, confidence)
+
+        return jsonify({
+            "image_b64": image_data_url,
+            "disease": disease,
+            "confidence": confidence,
+            "description": info["description"],
+            "actions": info["actions"],
+            "ai_advice": ai_advice,
+            "probabilities": result["probabilities"]
+        })
+
+    except Exception as e:
+        print("Prediction error:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+# ============================================================
+# MAIN ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+    print("")
+    print("=" * 65)
+    print("YOLOV8N RASPBERRY PI PLANT DISEASE SYSTEM")
+    print("=" * 65)
+    print(f"\nModel File: {MODEL_PATH}")
+    print(f"Input Shape: {model_input_details[0]['shape']}")
+    print(f"Output Shape: {model_output_details[0]['shape']}\n")
+    print(f"Resolution: {CAMERA_WIDTH}x{CAMERA_HEIGHT} @ {CAMERA_FPS} FPS\n")
+
+    if OPENROUTER_API_KEY:
+        print("OpenRouter AI Assistant: CONFIGURED")
+    else:
+        print("OpenRouter AI Assistant: OFF (Set OPENROUTER_API_KEY to enable)")
+
+    print("\nDashboard: http://<RASPBERRY_PI_IP>:5000\n")
+    print("=" * 65 + "\n")
+
+    app.run(
+        host="0.0.0.0",
+        port=5000,
+        threaded=True,
+        debug=False
+    )
